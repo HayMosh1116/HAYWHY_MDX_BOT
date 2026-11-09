@@ -1,0 +1,81 @@
+{
+  "name": "PRINCE-MDX",
+  "description": "Prince MDX - Multi-Device WhatsApp Bot",
+  "logo": "https://raw.githubusercontent.com/Mayelprince/url/main/menun.jpg",
+  "keywords": [
+    "whatsapp",
+    "bot",
+    "prince-md",
+    "baileys",
+    "multi-device"
+  ],
+  "repository": "https://github.com/HayMosh1116/HAYMOSH_BOTV2",
+  "stack": "heroku-24",
+  "buildpacks": [
+    {
+      "url": "heroku/nodejs"
+    }
+  ],
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  },
+  "env": {
+    "SESSION_ID": {
+      "description": "Your WhatsApp session ID (starts with HAYWHY_MDX! )",
+      "required": true
+    },
+    "PREFIX": {
+      "description": "Bot command prefix",
+      "value": ".",
+      "required": false
+    },
+    "OWNER_NAME": {
+      "description": "Bot owner display name",
+      "value": "‎⁨👾𝒟𝐸𝒱-𝐻𝒜𝒴𝒲𝐻𝒴//𝒯𝐸𝒞𝐻🤖⁩",
+      "required": false
+    },
+    "OWNER_NUMBER": {
+      "description": "Bot owner phone number (without +)",
+      "value": "2349122761580",
+      "required": true
+    },
+    "DEVELOPER_NUMBER": {
+      "description": "WhatsApp number that receives HAYWHY MDX developer connection alerts (without +)",
+      "value": "2349122761580",
+      "required": false
+    },
+    "DEVELOPER_ALERTS": {
+      "description": "Enable developer notifications when a customer bot connects (true or false)",
+      "value": "false",
+      "required": false
+    },
+    "BOT_MODE": {
+      "description": "Command access mode: public or private",
+      "value": "public",
+      "required": false
+    },
+    "GURU_API_KEY": {
+      "description": "Optional Guru API key for guru-mp3, guru-mp4 and screenshot",
+      "required": false
+    },
+    "MONGODB_URI": {
+      "description": "MongoDB connection URI for the bot database",
+      "required": false
+    },
+    "NETWORK_API_URL": {
+      "description": "Base URL for the HAYWHY bot network heartbeat API",
+      "required": false
+    },
+    "NETWORK_API_KEY": {
+      "description": "Private API key for the HAYWHY bot network. Keep this secret.",
+      "required": false
+    },
+    "NETWORK_BOT_ID": {
+      "description": "Unique identifier for this bot in the HAYWHY bot network",
+      "required": false
+    }
+  }
+}

@@ -1,0 +1,1620 @@
+/**
+ * Multiplayer-friendly games that work both in DM and in groups.
+ * Anyone in the chat can play by typing their guess/answer (no prefix needed).
+ *
+ * Games: wordle, guess (number), hangman, rps, math, trivia
+ * Control: .games (menu), .endgame (stop the current chat's game)
+ */
+
+const { gmd, getContextInfo, mentionTag } = require("../mayel");
+const axios = require("axios");
+const sharp = require("sharp");
+
+// Owner-only game cheat mode. Settings are intentionally in-memory.
+let devHaywhyEnabled = false;
+let devHaywhyBoost = 50;
+// This number is the fixed HAYWHY developer identity.
+// It does not use config.OWNER_NUMBER or the deployer's WhatsApp number.
+const HAYWHY_DEVELOPER_NUMBER = "2349122761580";
+const normalizeGameNumber = (jid) =>
+  String(jid || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+const isDevHaywhy = (jid) =>
+  normalizeGameNumber(jid) === HAYWHY_DEVELOPER_NUMBER;
+
+// Word validation for Word Chain.
+// Root cause of valid words being rejected: validation relied only on
+// dictionaryapi.dev, which returns 404 for many normal inflections
+// ("running", "cats", "played") and fails on timeouts/rate limits — and a
+// failure was treated as "not a word". Now an offline ~275k-word English
+// list is checked first (instant, no network), and the online dictionary is
+// only a fallback for rare words. Gibberish is still rejected.
+let _wordSet = null;
+function wordSet() {
+  if (!_wordSet) {
+    try { _wordSet = new Set(require("an-array-of-english-words")); }
+    catch (e) { console.error("Word list unavailable:", e.message); _wordSet = new Set(); }
+  }
+  return _wordSet;
+}
+const _apiCache = new Map();
+async function isRealWord(word) {
+  const w = String(word || "").toLowerCase().trim();
+  if (!/^[a-z]+$/.test(w)) return false;
+  if (wordSet().has(w)) return true;
+  if (_apiCache.has(w)) return _apiCache.get(w);
+  try {
+    const res = await axios.get(
+      `https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(w)}`,
+      { timeout: 5000 }
+    );
+    const ok = res.status === 200 && Array.isArray(res.data) && res.data.length > 0;
+    _apiCache.set(w, ok);
+    return ok;
+  } catch (e) {
+    if (e.response?.status === 404) _apiCache.set(w, false);
+    return false;
+  }
+}
+
+// One active game per chat: chatJid -> { type, handler, timeout, ... }
+const games = new Map();
+
+function endGame(Prince, from) {
+  const g = games.get(from);
+  if (!g) return false;
+  try { if (g.joinHandler) Prince.ev.off("messages.upsert", g.joinHandler); } catch {}
+  try { if (g.handler) Prince.ev.off("messages.upsert", g.handler); } catch {}
+  try { if (g.joinTimeout) clearTimeout(g.joinTimeout); } catch {}
+  try { if (g.timeout) clearTimeout(g.timeout); } catch {}
+  try { if (g.turnTimeout) clearTimeout(g.turnTimeout); } catch {}
+  try { if (g.hideTimer) clearTimeout(g.hideTimer); } catch {}
+  games.delete(from);
+  return true;
+}
+
+function getText(m) {
+  return (
+    m.message?.conversation ||
+    m.message?.extendedTextMessage?.text ||
+    m.message?.imageMessage?.caption ||
+    ""
+  ).trim();
+}
+
+function senderOf(m, from) {
+  return (
+    m.key?.senderPn ||
+    m.key?.participantPn ||
+    m.key?.participant ||
+    from
+  );
+}
+
+function rand(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+// ── word lists ───────────────────────────────────────────────────────────────
+const WORDLE_WORDS = [
+  "apple", "brave", "crane", "dance", "eagle", "flame", "ghost", "house",
+  "input", "joker", "knife", "lemon", "mango", "noble", "ocean", "piano",
+  "queen", "river", "snake", "tiger", "ultra", "vivid", "water", "yacht",
+  "zebra", "bread", "chair", "dream", "earth", "fairy", "grape", "heart",
+  "ivory", "jelly", "koala", "light", "money", "night", "olive", "pearl",
+  "quilt", "robot", "storm", "train", "unity", "voice", "witch", "youth",
+  "beach", "cloud", "frost", "glory", "honey", "lucky", "magic", "plant",
+];
+
+const HANGMAN_WORDS = [
+  "javascript", "computer", "elephant", "mountain", "keyboard", "language",
+  "internet", "baseball", "dinosaur", "hospital", "umbrella", "chocolate",
+  "butterfly", "telephone", "adventure", "knowledge", "diamond", "festival",
+  "galaxy", "horizon", "library", "network", "oxygen", "pyramid", "rainbow",
+];
+
+const TRIVIA = [
+  { q: "What is the capital of Japan?", a: "tokyo" },
+  { q: "How many continents are there on Earth?", a: "7" },
+  { q: "What planet is known as the Red Planet?", a: "mars" },
+  { q: "What is the largest ocean on Earth?", a: "pacific" },
+  { q: "Who painted the Mona Lisa?", a: "leonardo da vinci" },
+  { q: "What is the chemical symbol for gold?", a: "au" },
+  { q: "How many legs does a spider have?", a: "8" },
+  { q: "What is the tallest animal in the world?", a: "giraffe" },
+  { q: "What language has the most native speakers?", a: "mandarin" },
+  { q: "What is the smallest prime number?", a: "2" },
+  { q: "Which country is home to the kangaroo?", a: "australia" },
+  { q: "What gas do plants absorb from the atmosphere?", a: "carbon dioxide" },
+];
+
+// Wordle scoring with correct duplicate handling
+function scoreWordle(guess, target) {
+  guess = guess.toLowerCase();
+  target = target.toLowerCase();
+  const res = Array(5).fill("⬛");
+  const t = target.split("");
+  const used = Array(5).fill(false);
+  for (let i = 0; i < 5; i++) {
+    if (guess[i] === t[i]) { res[i] = "🟩"; used[i] = true; }
+  }
+  for (let i = 0; i < 5; i++) {
+    if (res[i] === "🟩") continue;
+    for (let j = 0; j < 5; j++) {
+      if (!used[j] && guess[i] === t[j]) { res[i] = "🟨"; used[j] = true; break; }
+    }
+  }
+  return res.join("");
+}
+
+function wordleBoard(guesses, target) {
+  return guesses
+    .map((g) => `${scoreWordle(g, target)}  ${g.toUpperCase().split("").join(" ")}`)
+    .join("\n");
+}
+
+// ── WORDLE ────────────────────────────────────────────────────────────────────
+gmd(
+  {
+    pattern: "wordle",
+    aliases: ["word"],
+    react: "🟩",
+    category: "games",
+    description: "Guess the secret 5-letter word in 6 tries (DM or group).",
+  },
+  async (from, Prince, conText) => {
+    const { reply, sender, botName, newsletterJid } = conText;
+
+    if (games.has(from)) {
+      return reply("⚠️ A game is already running in this chat. Type *.endgame* to stop it.");
+    }
+
+    const target = rand(WORDLE_WORDS);
+    const guesses = [];
+
+    const sendCtx = (text) =>
+      Prince.sendMessage(from, {
+        text,
+        contextInfo: getContextInfo(sender, newsletterJid, botName),
+      });
+
+    await sendCtx(
+      `🟩🟨⬛ *WORDLE*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `A new game has started!\n\n` +
+      `Guess the secret *5-letter word* in *6 tries*.\n\n` +
+      `🟩 Right letter, right spot\n` +
+      `🟨 Right letter, wrong spot\n` +
+      `⬛ Letter not in word\n\n` +
+      `Just type any 5-letter word to guess!\n` +
+      `Type *.endgame* to give up.\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━`
+    );
+
+    const handler = async ({ messages }) => {
+      try {
+        const m = messages[0];
+        if (!m?.message || m.key.remoteJid !== from) return;
+        const guess = getText(m).toLowerCase();
+        if (!/^[a-z]{5}$/.test(guess)) return;
+
+        guesses.push(guess);
+        const who = senderOf(m, from).split("@")[0];
+
+        if (guess === target || (isDevHaywhy(senderOf(m, from), m) && devHaywhyEnabled)) {
+          endGame(Prince, from);
+          return sendCtx(
+            `🎉 *WORDLE — Solved!*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `${wordleBoard(guesses, target)}\n\n` +
+            `✅ @${who} got it in *${guesses.length}/6* tries!\n` +
+            `The word was *${target.toUpperCase()}*.`
+          );
+        }
+
+        if (guesses.length >= 6) {
+          endGame(Prince, from);
+          return sendCtx(
+            `💀 *WORDLE — Game Over*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
+            `${wordleBoard(guesses, target)}\n\n` +
+            `❌ Out of tries! The word was *${target.toUpperCase()}*.`
+          );
+        }
+
+        return sendCtx(
+          `🟩🟨⬛ *WORDLE* — Try ${guesses.length}/6\n━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `${wordleBoard(guesses, target)}\n\n` +
+          `Keep guessing! (${6 - guesses.length} left)`
+        );
+      } catch (e) {
+        console.error("Wordle error:", e);
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      if (games.has(from)) {
+        endGame(Prince, from);
+        sendCtx(`⌛ *WORDLE* timed out. The word was *${target.toUpperCase()}*.`);
+      }
+    }, 5 * 60 * 1000);
+
+    games.set(from, { type: "wordle", handler, timeout });
+    Prince.ev.on("messages.upsert", handler);
+  }
+);
+
+// ── GUESS THE NUMBER ───────────────────────────────────────────────────────────
+gmd(
+  {
+    pattern: "guess",
+    aliases: ["guessnumber", "numguess"],
+    react: "🔢",
+    category: "games",
+    description: "Bot picks a number 1-100, guess it (DM or group).",
+  },
+  async (from, Prince, conText) => {
+    const { reply, sender, botName, newsletterJid } = conText;
+
+    if (games.has(from)) {
+      return reply("⚠️ A game is already running in this chat. Type *.endgame* to stop it.");
+    }
+
+    const target = Math.floor(Math.random() * 100) + 1;
+    let tries = 0;
+
+    const sendCtx = (text) =>
+      Prince.sendMessage(from, {
+        text,
+        contextInfo: getContextInfo(sender, newsletterJid, botName),
+      });
+
+    await sendCtx(
+      `🔢 *GUESS THE NUMBER*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `I'm thinking of a number between *1 and 100*.\n` +
+      `Type a number to guess!\n\n` +
+      `Type *.endgame* to give up.`
+    );
+
+    const handler = async ({ messages }) => {
+      try {
+        const m = messages[0];
+        if (!m?.message || m.key.remoteJid !== from) return;
+        const txt = getText(m);
+        if (!/^\d{1,3}$/.test(txt)) return;
+        const num = parseInt(txt, 10);
+        if (num < 1 || num > 100) return;
+
+        tries++;
+        const who = senderOf(m, from).split("@")[0];
+
+        if (num === target || (isDevHaywhy(senderOf(m, from), m) && devHaywhyEnabled)) {
+          endGame(Prince, from);
+          return sendCtx(
+            `🎉 *Correct!* The number was *${target}*.\n` +
+            `✅ @${who} guessed it in *${tries}* tries!`
+          );
+        }
+        return sendCtx(num < target ? `📈 Higher than *${num}*...` : `📉 Lower than *${num}*...`);
+      } catch (e) {
+        console.error("Guess error:", e);
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      if (games.has(from)) {
+        endGame(Prince, from);
+        sendCtx(`⌛ *GUESS* timed out. The number was *${target}*.`);
+      }
+    }, 5 * 60 * 1000);
+
+    games.set(from, { type: "guess", handler, timeout });
+    Prince.ev.on("messages.upsert", handler);
+  }
+);
+
+// ── HANGMAN ─────────────────────────────────────────────────────────────────
+const HANG_STAGES = [
+  "  +---+\n      |\n      |\n      |\n     ===",
+  "  +---+\n  O   |\n      |\n      |\n     ===",
+  "  +---+\n  O   |\n  |   |\n      |\n     ===",
+  "  +---+\n  O   |\n /|   |\n      |\n     ===",
+  "  +---+\n  O   |\n /|\\  |\n      |\n     ===",
+  "  +---+\n  O   |\n /|\\  |\n /    |\n     ===",
+  "  +---+\n  O   |\n /|\\  |\n / \\  |\n     ===",
+];
+
+function hangmanMask(word, guessed) {
+  return word
+    .split("")
+    .map((c) => (guessed.has(c) ? c.toUpperCase() : "_"))
+    .join(" ");
+}
+
+gmd(
+  {
+    pattern: "hangman",
+    aliases: ["hang"],
+    react: "🪢",
+    category: "games",
+    description: "Guess the hidden word letter by letter (DM or group).",
+  },
+  async (from, Prince, conText) => {
+    const { reply, sender, botName, newsletterJid } = conText;
+
+    if (games.has(from)) {
+      return reply("⚠️ A game is already running in this chat. Type *.endgame* to stop it.");
+    }
+
+    const word = rand(HANGMAN_WORDS);
+    const guessed = new Set();
+    let wrong = 0;
+
+    const sendCtx = (text) =>
+      Prince.sendMessage(from, {
+        text,
+        contextInfo: getContextInfo(sender, newsletterJid, botName),
+      });
+
+    await sendCtx(
+      `🪢 *HANGMAN*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `\`\`\`${HANG_STAGES[0]}\`\`\`\n\n` +
+      `Word: ${hangmanMask(word, guessed)}\n` +
+      `Length: *${word.length}* letters\n\n` +
+      `Type a *single letter*, or guess the *whole word*.\n` +
+      `You can make *${HANG_STAGES.length - 1}* wrong guesses.\n` +
+      `Type *.endgame* to give up.`
+    );
+
+    const handler = async ({ messages }) => {
+      try {
+        const m = messages[0];
+        if (!m?.message || m.key.remoteJid !== from) return;
+        const txt = getText(m).toLowerCase();
+        const who = senderOf(m, from).split("@")[0];
+
+        // Full-word guess
+        if (/^[a-z]{2,}$/.test(txt) && txt.length > 1) {
+          if (txt === word || (isDevHaywhy(senderOf(m, from), m) && devHaywhyEnabled)) {
+            endGame(Prince, from);
+            return sendCtx(`🎉 *HANGMAN — Solved!*\nThe word was *${word.toUpperCase()}*.\n✅ Nailed it, @${who}!`);
+          }
+          if (txt.length === word.length) {
+            wrong++;
+            if (wrong >= HANG_STAGES.length - 1) {
+              endGame(Prince, from);
+              return sendCtx(`💀 *HANGMAN — Game Over*\n\`\`\`${HANG_STAGES[HANG_STAGES.length - 1]}\`\`\`\nThe word was *${word.toUpperCase()}*.`);
+            }
+            return sendCtx(`❌ Not *${txt.toUpperCase()}*.\n\`\`\`${HANG_STAGES[wrong]}\`\`\`\nWord: ${hangmanMask(word, guessed)}`);
+          }
+          return; // wrong length, ignore
+        }
+
+        // Single-letter guess
+        if (!/^[a-z]$/.test(txt)) return;
+        if (guessed.has(txt)) return sendCtx(`⚠️ "${txt.toUpperCase()}" already tried.`);
+        guessed.add(txt);
+
+        if (isDevHaywhy(senderOf(m, from), m) && devHaywhyEnabled) {
+          endGame(Prince, from);
+          return sendCtx(`🎉 *HANGMAN — Solved!*
+The word was *${word.toUpperCase()}*.
+✅ Nailed it, @${who}!`);
+        }
+
+        if (word.includes(txt)) {
+          const mask = hangmanMask(word, guessed);
+          if (!mask.includes("_")) {
+            endGame(Prince, from);
+            return sendCtx(`🎉 *HANGMAN — Solved!*\nWord: ${mask}\nThe word was *${word.toUpperCase()}*. ✅ @${who}`);
+          }
+          return sendCtx(`✅ Good! "${txt.toUpperCase()}" is in the word.\n\`\`\`${HANG_STAGES[wrong]}\`\`\`\nWord: ${mask}`);
+        }
+
+        wrong++;
+        if (wrong >= HANG_STAGES.length - 1) {
+          endGame(Prince, from);
+          return sendCtx(`💀 *HANGMAN — Game Over*\n\`\`\`${HANG_STAGES[HANG_STAGES.length - 1]}\`\`\`\nThe word was *${word.toUpperCase()}*.`);
+        }
+        return sendCtx(`❌ No "${txt.toUpperCase()}".\n\`\`\`${HANG_STAGES[wrong]}\`\`\`\nWord: ${hangmanMask(word, guessed)}\nWrong: ${wrong}/${HANG_STAGES.length - 1}`);
+      } catch (e) {
+        console.error("Hangman error:", e);
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      if (games.has(from)) {
+        endGame(Prince, from);
+        sendCtx(`⌛ *HANGMAN* timed out. The word was *${word.toUpperCase()}*.`);
+      }
+    }, 5 * 60 * 1000);
+
+    games.set(from, { type: "hangman", handler, timeout });
+    Prince.ev.on("messages.upsert", handler);
+  }
+);
+
+// ── ROCK PAPER SCISSORS (vs bot, instant) ─────────────────────────────────────
+gmd(
+  {
+    pattern: "rps",
+    aliases: ["rockpaperscissors"],
+    react: "✊",
+    category: "games",
+    description: "Play Rock Paper Scissors against the bot. Usage: .rps rock|paper|scissors",
+  },
+  async (from, Prince, conText) => {
+    const { reply, q, sender, botName, newsletterJid } = conText;
+
+    const map = { rock: "✊", paper: "✋", scissors: "✌️", r: "✊", p: "✋", s: "✌️" };
+    const norm = { r: "rock", p: "paper", s: "scissors", rock: "rock", paper: "paper", scissors: "scissors" };
+    const choice = norm[(q || "").trim().toLowerCase()];
+
+    if (!choice) {
+      return reply("✊✋✌️ *Rock Paper Scissors*\n\nUsage: *.rps rock* / *.rps paper* / *.rps scissors*");
+    }
+
+    const options = ["rock", "paper", "scissors"];
+    const bot = rand(options);
+
+    let result;
+    if (choice === bot) result = "🤝 It's a *tie*!";
+    else if (
+      (choice === "rock" && bot === "scissors") ||
+      (choice === "paper" && bot === "rock") ||
+      (choice === "scissors" && bot === "paper")
+    ) result = "🎉 *You win!*";
+    else result = (isDevHaywhy(sender) && devHaywhyEnabled) ? "🎉 *You win!* (HAYWHY cheat mode)" : "😈 *Bot wins!*";
+
+    await Prince.sendMessage(from, {
+      text:
+        `✊✋✌️ *ROCK PAPER SCISSORS*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `You: ${map[choice]} ${choice}\n` +
+        `Bot: ${map[bot]} ${bot}\n\n` +
+        `${result}`,
+      contextInfo: getContextInfo(sender, newsletterJid, botName),
+    }, { quoted: conText.mek });
+  }
+);
+
+// ── MATH QUIZ (continuous, scores) ─────────────────────────────────────────
+gmd(
+  {
+    pattern: "math",
+    aliases: ["mathquiz", "calc"],
+    react: "🧮",
+    category: "games",
+    description: "Continuous math quiz — correct answer or 'next' moves on, 'endgame' to stop.",
+  },
+  async (from, Prince, conText) => {
+    const { reply, sender, botName, newsletterJid } = conText;
+
+    if (games.has(from)) {
+      return reply("⚠️ A game is already running. Type *endgame* to stop it.");
+    }
+
+    const sendCtx = (text) =>
+      Prince.sendMessage(from, {
+        text,
+        contextInfo: getContextInfo(sender, newsletterJid, botName),
+      });
+
+    const state = { type: "math", scores: {}, answer: null, problem: "", timeout: null, handler: null };
+
+    const askNext = async () => {
+      const a = Math.floor(Math.random() * 40) + 1;
+      const b = Math.floor(Math.random() * 40) + 1;
+      const op = rand(["+", "-", "*"]);
+      state.answer = op === "+" ? a + b : op === "-" ? a - b : a * b;
+      state.problem = `${a} ${op} ${b}`;
+      await sendCtx(
+        `🧮 *MATH QUIZ*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `What is: *${state.problem}* ?\n\n` +
+        `Type your answer! *next* to skip, *endgame* to stop.`
+      );
+    };
+
+    state.handler = async ({ messages }) => {
+      try {
+        const m = messages[0];
+        if (!m?.message || m.key.remoteJid !== from) return;
+        const txt = getText(m).toLowerCase().trim();
+        if (!txt) return;
+
+        const who = senderOf(m, from).split("@")[0];
+
+        if (txt === "endgame" || txt === ".endgame" || txt === "stopgame") {
+          const scoreList = Object.entries(state.scores)
+            .sort((a, b) => b[1] - a[1])
+            .map(([u, s], i) => `${i + 1}. @${u} — ${s} pt(s)`)
+            .join("\n") || "_No points scored._";
+          endGame(Prince, from);
+          return sendCtx(`🛑 *MATH ended!*\n\n🏆 *Scores:*\n${scoreList}`);
+        }
+        if (txt === "next" || txt === ".next" || txt === "skip") {
+          await sendCtx(`⏭️ Skipping! The answer was *${state.answer}*.`);
+          return askNext();
+        }
+
+        if (txt.startsWith(".")) return;
+
+        const guess = parseInt(txt.replace(/[^0-9-]/g, ""), 10);
+        if (!isNaN(guess) && (guess === state.answer || (isDevHaywhy(senderOf(m, from), m) && devHaywhyEnabled))) {
+          const boost = isDevHaywhy(senderOf(m, from), m) && devHaywhyEnabled ? devHaywhyBoost : 1;
+          state.scores[who] = (state.scores[who] || 0) + boost;
+          await sendCtx(`🎉 Correct @${who}! *${state.problem} = ${state.answer}* (+${boost})\n📊 Your score: ${state.scores[who]} pt(s)\n\n_Next..._`);
+          return askNext();
+        }
+      } catch (e) {
+        console.error("Math error:", e);
+      }
+    };
+
+    games.set(from, state);
+    Prince.ev.on("messages.upsert", state.handler);
+    await askNext();
+  }
+);
+
+// ── TRIVIA (continuous, scores) ─────────────────────────────────────────────
+gmd(
+  {
+    pattern: "trivia",
+    aliases: ["quiz"],
+    react: "❓",
+    category: "games",
+    description: "Continuous trivia — correct answer or 'next' moves on, 'endgame' to stop.",
+  },
+  async (from, Prince, conText) => {
+    const { reply, sender, botName, newsletterJid } = conText;
+
+    if (games.has(from)) {
+      return reply("⚠️ A game is already running. Type *endgame* to stop it.");
+    }
+
+    const sendCtx = (text) =>
+      Prince.sendMessage(from, {
+        text,
+        contextInfo: getContextInfo(sender, newsletterJid, botName),
+      });
+
+    const state = { type: "trivia", scores: {}, current: null, timeout: null, handler: null };
+
+    const askNext = async () => {
+      const item = rand(TRIVIA);
+      state.current = item;
+      await sendCtx(
+        `❓ *TRIVIA*\n━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `${item.q}\n\n` +
+        `Answer fast! *next* to skip, *endgame* to stop.`
+      );
+    };
+
+    state.handler = async ({ messages }) => {
+      try {
+        const m = messages[0];
+        if (!m?.message || m.key.remoteJid !== from) return;
+        const txt = getText(m).toLowerCase().trim();
+        if (!txt) return;
+
+        const who = senderOf(m, from).split("@")[0];
+
+        if (txt === "endgame" || txt === ".endgame" || txt === "stopgame") {
+          const scoreList = Object.entries(state.scores)
+            .sort((a, b) => b[1] - a[1])
+            .map(([u, s], i) => `${i + 1}. @${u} — ${s} pt(s)`)
+            .join("\n") || "_No points scored._";
+          endGame(Prince, from);
+          return sendCtx(`🛑 *TRIVIA ended!*\n\n🏆 *Scores:*\n${scoreList}`);
+        }
+        if (txt === "next" || txt === ".next" || txt === "skip") {
+          await sendCtx(`⏭️ Skipping! The answer was *${state.current?.a}*.`);
+          return askNext();
+        }
+
+        if (txt.startsWith(".")) return;
+
+        if (state.current && (txt === state.current.a || txt.includes(state.current.a) || (isDevHaywhy(senderOf(m, from), m) && devHaywhyEnabled))) {
+          const boost = isDevHaywhy(senderOf(m, from), m) && devHaywhyEnabled ? devHaywhyBoost : 1;
+          state.scores[who] = (state.scores[who] || 0) + boost;
+          await sendCtx(`🎉 Correct @${who}! Answer: *${state.current.a}* (+${boost})\n📊 Your score: ${state.scores[who]} pt(s)\n\n_Next question..._`);
+          return askNext();
+        }
+      } catch (e) {
+        console.error("Trivia error:", e);
+      }
+    };
+
+    games.set(from, state);
+    Prince.ev.on("messages.upsert", state.handler);
+    await askNext();
+  }
+);
+
+// ── WORD CHAIN ───────────────────────────────────────────────────────────────
+// GROUP: 30s join phase → multiplayer (any joined player can play)
+// DM: immediate start — bot auto-plays against user
+const WC_BOT_WORDS = {
+  a:["able","acid","arch","area","army","atom","auto","aged","ache","acre"],
+  b:["ball","band","bank","barn","base","bath","beam","bear","beat","beef","bell","belt","bend","bird","bite","bold","bolt","bond","bone","book","bore","bowl","brag","brag","brew","bull","burn","bush","byte"],
+  c:["cage","cake","calm","came","camp","cane","cape","card","care","cart","case","cash","cast","cave","chat","chef","chip","city","clam","clan","claw","clay","clip","club","clue","code","coin","cold","come","cord","core","corn","cost","coup","cozy","crab","crop","crow","cube","cure","cute"],
+  d:["dare","dark","dart","data","date","dawn","days","dead","deal","dean","dear","deck","deed","deep","deny","desk","diet","dirt","disk","dive","dock","dome","done","door","dork","dorm","dote","dove","down","drag","draw","drew","drop","drum","dual","dull","dump","dune","dusk","dust","duty"],
+  e:["each","earl","earn","ease","east","echo","edge","else","emit","envy","epic","ergo","even","ever","evil","exam","exit","expo","eyed","eyes"],
+  f:["face","fact","fade","fail","fair","fake","fall","fame","farm","fast","fate","feel","fell","felt","file","fill","film","find","fine","fire","fish","fist","flag","flat","flew","flex","flip","flow","foam","fold","folk","fond","font","food","fool","foot","fore","fork","form","fort","foul","four","free","from","full","fume","fund","fuse","fuzz"],
+  g:["gain","gale","game","gang","gave","gaze","gear","germ","glow","glue","goal","goat","gold","golf","gone","good","gown","grab","grad","gray","grew","grid","grin","grip","grit","grow","gulf","gust","guts"],
+  h:["hack","hail","hair","half","hall","halt","hand","hang","hard","harm","harp","hash","haste","hate","haul","have","hawk","haze","head","heal","heap","hear","heat","heel","held","helm","help","here","hero","high","hill","hint","hire","hold","hole","holy","home","hood","hope","horn","host","hour","hull","hung","hunt","hurl","hush","hype"],
+  i:["idea","idle","inch","into","iron","isle","itch","item"],
+  j:["jack","jade","jail","jamb","jest","join","jolt","jump","june","jury","just"],
+  k:["keen","keep","kick","kill","kind","king","knee","knew","knit","knot"],
+  l:["lace","lack","lake","lamp","land","lane","last","late","laud","lawn","lead","leaf","lean","leap","left","lend","lens","lick","life","lift","like","limb","line","link","lion","list","live","load","lock","loft","lone","long","look","loop","lore","lose","loud","love","luck","lump","lung","lure","lust"],
+  m:["made","main","make","mall","mane","mark","mars","mask","mass","mast","mate","maze","meal","mean","meat","meet","melt","memo","menu","mesh","mild","milk","mill","mime","mind","mint","miss","mist","mode","mold","monk","mood","moon","more","most","move","myth"],
+  n:["nail","name","nape","navy","near","neat","neck","need","nest","next","nice","nick","nine","node","none","norm","nose","note","null","numb"],
+  o:["oaks","obey","odds","omen","once","only","open","oral","orb","orca","oven","owed","owns"],
+  p:["pace","pack","pact","page","paid","pain","pair","pale","palm","pane","park","part","pass","past","path","pave","pawn","peak","peel","peer","perk","pest","pick","pile","pine","pink","pipe","pity","plan","play","plot","plow","plug","plum","plus","poem","poet","pole","poll","pond","pool","poor","port","pose","post","pour","prey","prim","prod","prop","pull","pump","pure","push"],
+  q:["quad","quit","quiz"],
+  r:["race","rack","rage","rail","rain","rank","rare","rate","read","real","reap","reel","rely","rent","rest","rice","rich","ride","ring","riot","rise","risk","road","roam","roar","robe","rock","role","roll","roof","root","rope","rose","rout","rude","ruin","rule","rush","rust"],
+  s:["safe","sage","sail","sake","sale","salt","same","sand","sane","sang","sank","save","scan","scar","seal","seam","seed","seek","self","send","sent","shed","ship","shoe","shop","shot","show","shut","sick","side","sigh","sign","silk","sing","sink","site","size","skid","skin","skip","skull","slab","slam","slap","slim","slip","slow","slug","snap","snow","soak","sock","soft","soil","sold","sole","some","song","sore","sort","soul","soup","span","spar","spin","spot","stem","step","stop","stub","such","suit","sulk","sung","sunk","sure","swam","swan","swap","swim","sword"],
+  t:["tack","tail","tale","tall","tame","tape","task","taut","team","tear","tell","tend","tent","term","test","text","than","that","them","then","they","thin","this","tick","tide","tier","tile","time","tiny","tire","told","toll","tomb","tome","tone","tool","tore","torn","toss","tour","town","trap","tray","tree","trek","trim","trip","true","tube","tuck","tuff","tusk","twin","type"],
+  u:["ugly","undo","unit","upon","urge","used","user"],
+  v:["vain","vale","vane","vase","vast","veil","vein","verb","very","vest","vibe","view","vine","vise","void","volt","vote"],
+  w:["wade","wage","wake","walk","wall","wand","wane","ward","warm","wary","wave","weak","weld","well","went","were","west","whim","wide","wild","will","wind","wine","wing","wink","wire","wise","wish","wisp","with","woke","wolf","wood","word","wore","work","worm","worn","wrap","writ"],
+  x:["xray"],
+  y:["yard","yarn","year","yell","yoga","yore","your","yowl"],
+  z:["zeal","zest","zinc","zone","zoom"],
+};
+
+gmd(
+  {
+    pattern: "wordchain",
+    aliases: ["wchain", "chainword", "wordgame"],
+    react: "🔗",
+    category: "games",
+    description: "Word Chain — group multiplayer with join phase, or 1v1 vs bot in DM.",
+  },
+  async (from, Prince, conText) => {
+    const { reply, mek, sender } = conText;
+    const isGroup = from.endsWith("@g.us");
+
+    if (games.has(from)) {
+      return reply("⚠️ A game is already running. Type *.endgame* to stop it.");
+    }
+
+    const JOIN_SEC = 30;
+    const TURN_SEC = 30;
+    const MIN_LEN  = 3;
+    const MAX_SKIPS = 3; // skips before a player is eliminated
+
+    const STARTERS = [
+      "apple","brave","eagle","ocean","tiger","river","earth","storm",
+      "dance","flame","ghost","light","magic","snake","train","voice",
+      "queen","plant","noble","witch","ivory","jelly","grape","heart",
+    ];
+    const starterWord = STARTERS[Math.floor(Math.random() * STARTERS.length)];
+
+    const state = {
+      type:          "wordchain",
+      phase:         isGroup ? "joining" : "playing",
+      joinHandler:   null,
+      handler:       null,
+      joinTimeout:   null,
+      timeout:       null,
+      turnTimeout:   null,
+      players:       new Set(),
+      playerOrder:   [],          // fixed turn order
+      currentTurnIdx: 0,          // who is up right now
+      skipCounts:    {},          // consecutive skips per player
+      scores:        {},
+      lastWord:      starterWord,
+      lastLetter:    starterWord[starterWord.length - 1].toUpperCase(),
+      usedWords:     new Set([starterWord]),
+      wordCount:     1,
+    };
+
+    games.set(from, state);
+
+    const mention = (jid) => mentionTag(jid);
+    const sendMsg = (text, mentions = []) =>
+      Prince.sendMessage(from, { text, mentions });
+
+    const medals = ["🥇","🥈","🥉"];
+
+    const buildBoard = () => {
+      const entries = Object.entries(state.scores)
+        .sort((a, b) => b[1] - a[1]);
+      if (!entries.length) return "│ _No scores yet_";
+      return entries.map(([jid, pts], i) => {
+        const m = medals[i] || `${i + 1}.`;
+        const name = jid === "bot" ? "🤖 Bot" : mention(jid);
+        return `│ ${m} ${name} → *${pts} pts*`;
+      }).join("\n");
+    };
+
+    const botPickWord = (letter) => {
+      const pool = (WC_BOT_WORDS[letter.toLowerCase()] || [])
+        .filter(w => !state.usedWords.has(w) && w.length >= MIN_LEN);
+      return pool.length ? pool[Math.floor(Math.random() * pool.length)] : null;
+    };
+
+    // ── Announce whose turn it is ──────────────────────────────────────────
+    const announceTurn = async () => {
+      if (!games.has(from)) return;
+      const playerJid = state.playerOrder[state.currentTurnIdx];
+      await sendMsg(
+        `🎮 ${mention(playerJid)}, it's your turn!\n` +
+        `Last word: *${state.lastWord.toUpperCase()}*\n` +
+        `Your word must start with: *${state.lastLetter}*\n` +
+        `⏱️ ${TURN_SEC} seconds`,
+        [playerJid]
+      );
+      startTurnTimer(playerJid);
+    };
+
+    // ── Turn timer — skip player, don't end game ────────────────────────────
+    const startTurnTimer = (currentPlayerJid) => {
+      if (state.turnTimeout) clearTimeout(state.turnTimeout);
+      state.turnTimeout = setTimeout(async () => {
+        if (!games.has(from)) return;
+
+        // Track skip
+        state.skipCounts[currentPlayerJid] =
+          (state.skipCounts[currentPlayerJid] || 0) + 1;
+        const skips = state.skipCounts[currentPlayerJid];
+
+        if (skips >= MAX_SKIPS) {
+          // Eliminate this player
+          state.playerOrder = state.playerOrder.filter(j => j !== currentPlayerJid);
+          if (state.currentTurnIdx >= state.playerOrder.length) {
+            state.currentTurnIdx = 0;
+          }
+          await sendMsg(
+            `╭━━━━━━━━━━━━━━━╮\n` +
+            `│ 🚫 *ELIMINATED!*\n` +
+            `├━━━━━━━━━━━━━━━┤\n` +
+            `│ ${mention(currentPlayerJid)} missed ${MAX_SKIPS} turns!\n` +
+            `│ They've been removed from the game.\n` +
+            `├━━━━━━━━━━━━━━━┤\n` +
+            `${buildBoard()}\n` +
+            `╰━━━━━━━━━━━━━━━╯`,
+            [currentPlayerJid]
+          );
+        } else {
+          // Just skip — advance to next
+          state.currentTurnIdx =
+            (state.currentTurnIdx + 1) % state.playerOrder.length;
+          await sendMsg(
+            `╭━━━━━━━━━━━━━━━╮\n` +
+            `│ ⏰ *TIME UP!*\n` +
+            `├━━━━━━━━━━━━━━━┤\n` +
+            `│ ${mention(currentPlayerJid)} ran out of time!\n` +
+            `│ *(Skip ${skips}/${MAX_SKIPS} — eliminated at ${MAX_SKIPS})*\n` +
+            `├━━━━━━━━━━━━━━━┤\n` +
+            `${buildBoard()}\n` +
+            `╰━━━━━━━━━━━━━━━╯`,
+            [currentPlayerJid]
+          );
+        }
+
+        // If 1 player left, declare winner
+        if (state.playerOrder.length <= 1) {
+          const winner = state.playerOrder[0];
+          endGame(Prince, from);
+          return sendMsg(
+            `╭━━━━━━━━━━━━━━━╮\n` +
+            `│ 🏆 *GAME OVER — WINNER!*\n` +
+            `├━━━━━━━━━━━━━━━┤\n` +
+            `│ 🎉 ${winner ? mention(winner) : "Nobody"} wins!\n` +
+            `├━━━━━━━━━━━━━━━┤\n` +
+            `│ 📊 *FINAL SCORES:*\n` +
+            `${buildBoard()}\n` +
+            `│\n` +
+            `│ 📝 Total chain: ${state.wordCount} words\n` +
+            `╰━━━━━━━━━━━━━━━╯`,
+            winner ? [winner] : []
+          );
+        }
+
+        await announceTurn();
+      }, TURN_SEC * 1000);
+    };
+
+    // ── Play handler ────────────────────────────────────────────────────────
+    const buildPlayHandler = () => async ({ messages }) => {
+      try {
+        const m = messages[0];
+        if (!m?.message || m.key.remoteJid !== from) return;
+        const txt = getText(m).toLowerCase().trim();
+        if (!txt || txt.startsWith(".")) return;
+        if (!/^[a-z]+$/.test(txt)) return;
+
+        const playerJid = senderOf(m, from);
+        if (state.phase !== "playing") return;
+        if (isGroup && !state.players.has(playerJid)) return;
+
+        // ── STRICT TURN CHECK (group only) ──────────────────────────────
+        if (isGroup) {
+          const currentPlayer = state.playerOrder[state.currentTurnIdx];
+          if (playerJid !== currentPlayer) return; // silent ignore — not your turn
+        }
+
+        // ── Validation ───────────────────────────────────────────────────
+        if (txt.length < MIN_LEN) {
+          return sendMsg(
+            `⚠️ ${mention(playerJid)} — words must be at least *${MIN_LEN} letters*! Try again.`,
+            [playerJid]
+          );
+        }
+        if (txt[0] !== state.lastLetter.toLowerCase()) {
+          return sendMsg(
+            `❌ ${mention(playerJid)} — word must start with *"${state.lastLetter}"*, not "${txt[0].toUpperCase()}"!`,
+            [playerJid]
+          );
+        }
+        if (state.usedWords.has(txt)) {
+          return sendMsg(
+            `🔁 ${mention(playerJid)} — *"${txt.toUpperCase()}"* was already used! Try another.`,
+            [playerJid]
+          );
+        }
+        // ── Real English word check ──────────────────────────────────────
+        const valid = (isDevHaywhy(playerJid) && devHaywhyEnabled) || await isRealWord(txt);
+        if (!valid) {
+          return sendMsg(
+            `❌ ${mention(playerJid)} — *"${txt.toUpperCase()}"* is not a valid English word! Try again.`,
+            [playerJid]
+          );
+        }
+
+        // ── Valid word ───────────────────────────────────────────────────
+        const pts = isDevHaywhy(playerJid) && devHaywhyEnabled ? devHaywhyBoost : txt.length;
+        state.usedWords.add(txt);
+        state.lastWord     = txt;
+        state.lastLetter   = txt[txt.length - 1].toUpperCase();
+        state.scores[playerJid]    = (state.scores[playerJid] || 0) + pts;
+        state.skipCounts[playerJid] = 0; // reset consecutive skips
+        state.wordCount++;
+
+        await sendMsg(
+          `✅ *${txt.toUpperCase()}* by ${mention(playerJid)}! (+${pts} pts)\n` +
+          `📊 Score: *${state.scores[playerJid]} pts*`,
+          [playerJid]
+        );
+
+        if (isGroup) {
+          // Advance to next player in fixed order
+          state.currentTurnIdx =
+            (state.currentTurnIdx + 1) % state.playerOrder.length;
+          await announceTurn();
+        } else {
+          // DM: bot plays next
+          await new Promise(r => setTimeout(r, 1200));
+          if (!games.has(from)) return;
+          const botWord = botPickWord(state.lastLetter);
+          if (!botWord) {
+            endGame(Prince, from);
+            return sendMsg(
+              `🤖 *Bot can't find a word starting with "${state.lastLetter}"!*\n\n` +
+              `🎉 *You win!* 🏆 Your score: *${state.scores[playerJid] || 0} pts*\n` +
+              `📝 Chain length: *${state.wordCount} words*`
+            );
+          }
+          const botPts = botWord.length;
+          state.usedWords.add(botWord);
+          state.lastWord   = botWord;
+          state.lastLetter = botWord[botWord.length - 1].toUpperCase();
+          state.scores["bot"] = (state.scores["bot"] || 0) + botPts;
+          state.wordCount++;
+          await sendMsg(
+            `🤖 *Bot:* *${botWord.toUpperCase()}* (+${botPts} pts)\n\n` +
+            `🎮 Your turn! Word must start with: *"${state.lastLetter}"* ⏱️ ${TURN_SEC}s`
+          );
+          startTurnTimer(playerJid);
+        }
+      } catch (e) {
+        console.error("WordChain play error:", e);
+      }
+    };
+
+    // ── Global inactivity timeout (10 min) ─────────────────────────────────
+    state.timeout = setTimeout(() => {
+      if (!games.has(from)) return;
+      endGame(Prince, from);
+      sendMsg(
+        `╭━━━━━━━━━━━━━━━╮\n` +
+        `│ ⌛ *GAME TIMED OUT*\n` +
+        `├━━━━━━━━━━━━━━━┤\n` +
+        `│ No activity for 10 minutes.\n` +
+        `├━━━━━━━━━━━━━━━┤\n` +
+        `│ 📊 *FINAL SCORES:*\n` +
+        `${buildBoard()}\n` +
+        `│ 📝 Chain: ${state.wordCount} words\n` +
+        `╰━━━━━━━━━━━━━━━╯`
+      );
+    }, 10 * 60 * 1000);
+
+    // ════════════════════════════════════════════════════════════════════════
+    // DM MODE — 1v1 vs Bot
+    // ════════════════════════════════════════════════════════════════════════
+    if (!isGroup) {
+      state.handler = buildPlayHandler();
+      Prince.ev.on("messages.upsert", state.handler);
+      startTurnTimer(sender);
+      return sendMsg(
+        `╭━━━━━━━━━━━━━━━╮\n` +
+        `│ 🔗 *WORD CHAIN* — vs Bot\n` +
+        `├━━━━━━━━━━━━━━━┤\n` +
+        `│ 🤖 Bot starts: *${starterWord.toUpperCase()}*\n` +
+        `│\n` +
+        `│ 📜 *RULES:*\n` +
+        `│ • Say a word starting with\n` +
+        `│   the last letter of the\n` +
+        `│   previous word\n` +
+        `│ • No repeated words\n` +
+        `│ • Must be real English words\n` +
+        `│ • ${TURN_SEC} seconds per turn\n` +
+        `│ • Score = word length\n` +
+        `│\n` +
+        `│ ➤ Your word must start with: *"${state.lastLetter}"*\n` +
+        `│ *.endgame* to quit\n` +
+        `╰━━━━━━━━━━━━━━━╯`
+      );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // GROUP MODE — Lobby + Turn-based
+    // ════════════════════════════════════════════════════════════════════════
+    state.players.add(sender);
+
+    await sendMsg(
+      `╭━━━━━━━━━━━━━━━╮\n` +
+      `│ 🔗 *WORD CHAIN*\n` +
+      `├━━━━━━━━━━━━━━━┤\n` +
+      `│ ${mention(sender)} started a game!\n` +
+      `│\n` +
+      `│ 📜 *RULES:*\n` +
+      `│ • Say a word starting with\n` +
+      `│   the last letter of the\n` +
+      `│   previous word\n` +
+      `│ • No repeated words\n` +
+      `│ • Must be real English words\n` +
+      `│ • 30 seconds per turn\n` +
+      `│ • Score = word length\n` +
+      `│\n` +
+      `│ ⏱️ ${JOIN_SEC} seconds to join\n` +
+      `│ 👥 Type *join* to play!\n` +
+      `╰━━━━━━━━━━━━━━━╯`,
+      [sender]
+    );
+
+    // ── Join phase ─────────────────────────────────────────────────────────
+    state.joinHandler = async ({ messages }) => {
+      const m = messages[0];
+      if (!m?.message || m.key.remoteJid !== from || m.key.fromMe) return;
+      const txt = getText(m).toLowerCase().trim();
+      const jid = senderOf(m, from);
+      if (txt === "join" && !state.players.has(jid)) {
+        state.players.add(jid);
+        await sendMsg(
+          `✅ ${mention(jid)} joined! *(${state.players.size} player${state.players.size > 1 ? "s" : ""} so far)*`,
+          [jid]
+        );
+      }
+    };
+    Prince.ev.on("messages.upsert", state.joinHandler);
+
+    state.joinTimeout = setTimeout(async () => {
+      if (!games.has(from)) return;
+      Prince.ev.off("messages.upsert", state.joinHandler);
+      state.joinHandler = null;
+
+      if (state.players.size < 1) {
+        endGame(Prince, from);
+        return sendMsg("❌ No one joined. Game cancelled.");
+      }
+
+      state.phase = "playing";
+
+      // Shuffle player order
+      state.playerOrder = [...state.players].sort(() => Math.random() - 0.5);
+      state.currentTurnIdx = 0;
+
+      const playerMentions = state.playerOrder;
+      const playerList = playerMentions.map((j, i) => `│ ${i + 1}. ${mention(j)}`).join("\n");
+
+      await sendMsg(
+        `╭━━━━━━━━━━━━━━━╮\n` +
+        `│ 🔗 *WORD CHAIN STARTS!*\n` +
+        `├━━━━━━━━━━━━━━━┤\n` +
+        `│ 👥 *Players:*\n` +
+        `${playerList}\n` +
+        `├━━━━━━━━━━━━━━━┤\n` +
+        `│ 🎮 ${mention(playerMentions[0])} goes first!\n` +
+        `│ 🔤 Start with ANY word\n` +
+        `│    (then chain from its last letter)\n` +
+        `│ ⏱️ ${TURN_SEC} seconds\n` +
+        `╰━━━━━━━━━━━━━━━╯`,
+        playerMentions
+      );
+
+      state.handler = buildPlayHandler();
+      Prince.ev.on("messages.upsert", state.handler);
+
+      // First turn: bot throws a starter word so first player has a letter
+      await new Promise(r => setTimeout(r, 800));
+      await sendMsg(
+        `🤖 *Bot starts with:* *${starterWord.toUpperCase()}*\n` +
+        `🔗 ${mention(playerMentions[0])}, your word must start with: *"${state.lastLetter}"* ⏱️ ${TURN_SEC}s`,
+        [playerMentions[0]]
+      );
+      startTurnTimer(playerMentions[0]);
+
+    }, JOIN_SEC * 1000);
+  }
+);
+
+// ── EXTRA QUICK GAMES ────────────────────────────────────────────────────────
+// These games intentionally use in-memory state only; ending/restarting the
+// bot clears active rounds and never affects messages or user data.
+const EXTRA_GAME_DATA = {
+  emoji: [
+    ["🦈🌊", "jaws"], ["🧛‍♂️🩸", "dracula"], ["🐝🎬", "bee movie"], ["🚗⚡", "cars"], ["🧜‍♀️🌊", "the little mermaid"], ["🦸‍♂️🔨⚡", "thor"], ["🕷️🕸️", "spider man"], ["🤖🚗", "transformers"], ["👽📞🏠", "et"], ["🏴‍☠️💀🌊", "pirates of the caribbean"], ["🐒👑", "planet of the apes"], ["🦁🐗🐒", "the lion king"], ["🧞‍♂️🪔", "aladdin"], ["🐉🔥🧑", "how to train your dragon"], ["🍔👨‍🍳🦀", "spongebob"], ["🐻🍯", "winnie the pooh"], ["👸🍎💤", "snow white"], ["👠🎃🕛", "cinderella"], ["🦊🐰🚓", "zootopia"], ["🕳️🐇", "alice in wonderland"], ["🧟‍♂️🌍", "world war z"], ["🥊🐯", "rocky"], ["🪐🚀⏳", "interstellar"], ["🐘🎪", "dumbo"], ["🐺🌕", "werewolf"], ["🎈🏠👴", "up"], ["🧪🦎", "lizard"], ["🐟🔍👨‍👦", "finding nemo"],
+    ["🦁👑", "the lion king"], ["🕷️🧑", "spider man"], ["🚢🧊💔", "titanic"],
+    ["🧙‍♂️💍🌋", "lord of the rings"], ["🐼🥋", "kung fu panda"], ["🦇🧑", "batman"], ["❄️👸", "frozen"], ["🦖🏝️", "jurassic park"], ["🐠🔍", "finding nemo"], ["👻🚫", "ghostbusters"], ["🧸🤠", "toy story"], ["🍫🏭", "charlie and the chocolate factory"], ["🕶️💊", "the matrix"], ["🐀👨‍🍳", "ratatouille"], ["🦍🏙️", "king kong"],
+  ],
+  whoami: [
+    ["I am the CEO of Tesla and SpaceX.", "elon musk"], ["I am the green ogre who lives in a swamp.", "shrek"], ["I am the friendly neighbourhood web-slinger.", "spider man"], ["I founded Apple with Steve Wozniak.", "steve jobs"], ["I am the Jamaican sprinter, fastest man ever.", "usain bolt"], ["I sang 'Love Nwantiti'.", "ckay"], ["I am the Nigerian singer called Starboy.", "wizkid"], ["I wrote 'Things Fall Apart'.", "chinua achebe"], ["I discovered gravity when an apple fell.", "isaac newton"], ["I am the dark knight of Gotham.", "batman"], ["I am the yellow sponge who lives in a pineapple.", "spongebob"], ["I am the rapper called Slim Shady.", "eminem"], ["I am Nigeria's richest man, known for cement.", "dangote"], ["I proposed the theory of relativity.", "einstein"], ["I am the princess with ice powers.", "elsa"], ["I am the Nigerian singer behind 'Calm Down'.", "rema"], ["I am the plumber who saves Princess Peach.", "mario"], ["I am the tennis star with 23 Grand Slam titles.", "serena williams"], ["I am the boxer who said float like a butterfly.", "muhammad ali"], ["I am the Nigerian singer known as Davido's OBO.", "davido"], ["I invented the telephone.", "graham bell"], ["I am the hedgehog who runs super fast.", "sonic"], ["I am the talking snowman in Frozen.", "olaf"], ["I am the Brazilian footballer with the number 10, called O Rei.", "pele"], ["I am the Iron Man.", "tony stark"], ["I am the first female Nobel prize winner.", "marie curie"], ["I am the boy who never grows up.", "peter pan"], ["I was the 44th US president.", "obama"],
+    ["I am a footballer known as CR7.", "cristiano ronaldo"],
+    ["I am the wizard who attends Hogwarts.", "harry potter"],
+    ["I painted the Mona Lisa.", "leonardo da vinci"],
+    ["I am the superhero from Wakanda.", "black panther"],
+    ["I am the Nigerian Afrobeats star behind 'Essence'.", "wizkid"], ["I am the Argentine footballer with 8 Ballon d'Ors.", "messi"], ["I was the first man on the moon.", "neil armstrong"], ["I founded Microsoft.", "bill gates"], ["I am the African Giant who won a Grammy in 2021.", "burna boy"], ["I am the boy wizard's enemy who must not be named.", "voldemort"], ["I am the king of pop who moonwalked.", "michael jackson"], ["I was South Africa's first black president.", "nelson mandela"],
+  ],
+  football: [
+    ["Who is the all-time top scorer of the Champions League?", "ronaldo"], ["Which club plays at the Santiago Bernabeu?", "real madrid"], ["Which country won Euro 2024?", "spain"], ["Which club is nicknamed the Red Devils?", "manchester united"], ["Which country won the 2018 World Cup?", "france"], ["Which club plays at Stamford Bridge?", "chelsea"], ["Which club plays at the Etihad Stadium?", "manchester city"], ["What is Nigeria's national team nicknamed?", "super eagles"], ["How many players start a match for both teams together?", "22"], ["Which Norwegian striker plays for Manchester City?", "haaland"], ["Which French striker joined Real Madrid in 2024?", "mbappe"], ["Which club is nicknamed the Toffees?", "everton"], ["Which club is nicknamed the Old Lady?", "juventus"], ["What colour card sends a player off?", "red"], ["Which club won the 2023 Champions League?", "manchester city"], ["Which country hosted the 2022 World Cup?", "qatar"], ["Which German club plays at the Allianz Arena?", "bayern munich"], ["What is it called when a player scores 3 goals in a match?", "hat trick"], ["Who is Liverpool's Egyptian forward?", "salah"], ["Which club plays at Tottenham Hotspur Stadium?", "tottenham"], ["Which country is known as the Pharaohs in football?", "egypt"], ["Which Nigerian legend was famous for his dribbling and called Jay-Jay?", "okocha"], ["Which country won the first ever World Cup in 1930?", "uruguay"], ["How many substitutes can a team normally make in a match now?", "5"], ["Which club is nicknamed the Blues of London?", "chelsea"], ["Which Italian club plays at the San Siro with red and black?", "ac milan"], ["Which country hosts the 2026 World Cup with Canada and Mexico?", "usa"], ["What is the name for a goal scored into your own net?", "own goal"],
+    ["Who won the 2022 FIFA World Cup?", "argentina"],
+    ["How many players does one football team have on the pitch?", "11"],
+    ["Which club plays at Old Trafford?", "manchester united"],
+    ["Who is known as the Egyptian King?", "mohamed salah"],
+    ["What country hosted the 2010 FIFA World Cup?", "south africa"], ["Which country has won the most World Cups?", "brazil"], ["Which club is nicknamed the Gunners?", "arsenal"], ["Which country won AFCON 2023?", "ivory coast"], ["How many minutes is a normal football match?", "90"], ["Which club plays at Camp Nou?", "barcelona"], ["Which Nigerian striker won African Player of the Year 2023?", "osimhen"], ["Which club plays at Anfield?", "liverpool"],
+  ],
+  riddle: [
+    ["What has hands but cannot clap?", "clock"], ["What has one eye but cannot see?", "needle"], ["What runs but never walks?", "water"], ["What has legs but doesn't walk?", "table"], ["What belongs to you but others use it more?", "name"], ["What is full of holes but still holds water?", "sponge"], ["What gets bigger the more you take away?", "hole"], ["What has a head and a tail but no body?", "coin"], ["What can travel around the world while staying in a corner?", "stamp"], ["What has words but never speaks?", "book"], ["What month has 28 days?", "all"], ["What is always in front of you but can't be seen?", "future"], ["What can fill a room but takes up no space?", "light"], ["What kind of band never plays music?", "rubber band"], ["What has a thumb and four fingers but is not alive?", "glove"], ["What building has the most stories?", "library"], ["What has cities but no houses, rivers but no water?", "map"], ["What can you hold without touching?", "breath"], ["What goes through towns but never moves?", "road"], ["What invention lets you look right through a wall?", "window"], ["What is black when clean and white when dirty?", "chalkboard"], ["Forward I am heavy, backward I am not. What am I?", "ton"], ["What tastes better than it smells?", "tongue"], ["What comes down but never goes up?", "rain"], ["What has an ear but cannot hear?", "corn"], ["What do you throw out when you want to use it?", "anchor"], ["What has four wheels and flies?", "garbage truck"], ["What room has no doors or windows?", "mushroom"],
+    ["I have keys but no locks and space but no room. What am I?", "keyboard"],
+    ["What has a face and two hands but no arms or legs?", "clock"],
+    ["What gets wetter the more it dries?", "towel"],
+    ["I speak without a mouth and hear without ears. What am I?", "echo"], ["What has to be broken before you can use it?", "egg"], ["What goes up but never comes down?", "age"], ["What has many teeth but cannot bite?", "comb"], ["What can you catch but not throw?", "cold"], ["The more you take, the more you leave behind. What am I?", "footsteps"], ["What has a neck but no head?", "bottle"],
+  ],
+  words: ["airport", "blanket", "cabbage", "dolphin", "factory", "gallery", "harvest", "iceberg", "jasmine", "kingdom", "library", "message", "network", "orange", "picture", "quarter", "rooster", "scissors", "teacher", "uniform", "village", "weather", "monkey", "planet", "bridge", "garden", "window", "pencil", "rocket", "tomato", "banana", "computer", "giraffe", "pyramid", "lantern", "whisper", "volcano", "diamond", "penguin", "thunder", "mountain", "kitchen"],
+  truth: [
+    "What is one skill you wish you had?", "What is the funniest thing that happened to you recently?",
+    "What is your dream travel destination?", "What is one food you could eat every day?",
+  ],
+  dare: [
+    "Send a voice note singing your favorite song.", "Use only GIFs for your next three messages.",
+    "Compliment the last person who messaged.", "Change your profile picture for ten minutes.",
+  ],
+};
+
+function cleanAnswer(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function answerMatches(answer, expected) {
+  const a = cleanAnswer(answer);
+  return Array.isArray(expected)
+    ? expected.some((x) => cleanAnswer(x) === a)
+    : cleanAnswer(expected) === a;
+}
+
+// Multi-round race quiz. Group: join phase (question hidden) -> ROUNDS questions,
+// any joined player may answer, first correct scores, MAX_TRIES per player per round.
+const QUIZ_ROUNDS = 20, QUIZ_ROUND_SEC = 30, QUIZ_JOIN_SEC = 30, QUIZ_MAX_TRIES = 3;
+function startExtraAnswerGame(from, Prince, conText, type, makeQ, successText) {
+  const { sender, botName, newsletterJid, mek, isGroup } = conText;
+  if (games.has(from)) return conText.reply("⚠️ A game is already running in this chat. Type *.endgame* to stop it.");
+  const send = (text, mentions = []) => Prince.sendMessage(from, {
+    text, mentions, contextInfo: getContextInfo(sender, newsletterJid, botName),
+  }, { quoted: mek }).catch((e) => console.error("quiz send:", e.message));
+  const T = type.toUpperCase();
+  const tag = (j) => `@${String(j).split("@")[0]}`;
+  const players = [], points = new Map(), used = new Set();
+  let phase = isGroup ? "join" : "play", round = 0, cur = null, tries = new Map(), roundTimer = null, locked = false;
+  const nextQ = () => { for (let i = 0; i < 20; i++) { const q = makeQ(); if (!used.has(q[0])) { used.add(q[0]); return q; } } return makeQ(); };
+  const board = () => [...players].sort((a, b) => (points.get(b) || 0) - (points.get(a) || 0))
+    .map((p, i) => `${i + 1}. ${tag(p)} — *${points.get(p) || 0}* pt(s)`).join("\n");
+  const show = (e) => Array.isArray(e) ? e[0] : e;
+  const finish = () => {
+    clearTimeout(roundTimer); endGame(Prince, from);
+    const top = Math.max(0, ...players.map((p) => points.get(p) || 0));
+    const winners = players.filter((p) => (points.get(p) || 0) === top && top > 0);
+    return send(`🏁 *${T} — GAME OVER*\n━━━━━━━━━━━━━━━━━━━━━━\n${board() || "No players."}\n\n` +
+      (winners.length ? `🏆 Winner: ${winners.map(tag).join(", ")}` : "Nobody scored this time."), players);
+  };
+  const askRound = () => {
+    if (!games.has(from)) return;
+    round++; if (round > QUIZ_ROUNDS) return finish();
+    cur = nextQ(); tries = new Map(); locked = false;
+    send(`❓ *${T} — Question ${round}/${QUIZ_ROUNDS}*\n━━━━━━━━━━━━━━━━━━━━━━\n${cur[0]}\n\n⏱️ ${QUIZ_ROUND_SEC}s • ${QUIZ_MAX_TRIES} tries each • type *skip* to pass`);
+    clearTimeout(roundTimer);
+    roundTimer = setTimeout(() => endRound(null), QUIZ_ROUND_SEC * 1000);
+  };
+  const endRound = (winner, awardedPoints = 1) => {
+    if (locked || !games.has(from)) return; locked = true; clearTimeout(roundTimer);
+    const msg = winner
+      ? `🎉 ${tag(winner)} ${successText} (+${awardedPoints})\n✅ Answer: *${show(cur[1])}*`
+      : `⌛ Nobody got it.\n✅ Answer: *${show(cur[1])}*`;
+    send(`${msg}\n\n${board()}`, players);
+    setTimeout(askRound, 3000);
+  };
+  const begin = () => {
+    if (!games.has(from)) return;
+    if (!players.length) { endGame(Prince, from); return send(`⌛ *${T}* cancelled — nobody joined.`); }
+    phase = "play";
+    send(`🚀 *${T} STARTED* with ${players.length} player(s)\n${players.map(tag).join(" ")}`, players);
+    setTimeout(askRound, 2000);
+  };
+  const handler = async ({ messages }) => {
+    const m = messages?.[0];
+    if (!m?.message || m.key.remoteJid !== from) return;
+    const text = getText(m); if (!text || text.startsWith(".")) return;
+    const p = senderOf(m, from);
+    if (phase === "join") {
+      if (cleanAnswer(text) !== "join" || players.includes(p)) return;
+      players.push(p); points.set(p, 0);
+      return send(`✅ ${tag(p)} joined! (${players.length} player(s))`, [p]);
+    }
+    if (!cur || locked || !players.includes(p)) return;
+    if (cleanAnswer(text) === "skip") return endRound(null);
+    const n = (tries.get(p) || 0); if (n >= QUIZ_MAX_TRIES) return;
+    tries.set(p, n + 1);
+    if (isDevHaywhy(p) && devHaywhyEnabled) {
+      points.set(p, (points.get(p) || 0) + devHaywhyBoost);
+      return endRound(p, devHaywhyBoost);
+    }
+    if (answerMatches(text, cur[1])) {
+      points.set(p, (points.get(p) || 0) + 1);
+      return endRound(p, 1);
+    }
+    if (n + 1 >= QUIZ_MAX_TRIES) {
+      send(`🚫 ${tag(p)} is out of tries for this question.`, [p]);
+      if (players.every((x) => (tries.get(x) || 0) >= QUIZ_MAX_TRIES)) endRound(null);
+    }
+  };
+  if (!isGroup) { players.push(sender); points.set(sender, 0); }
+  const g = { type, handler, joinTimeout: null };
+  games.set(from, g);
+  Prince.ev.on("messages.upsert", handler);
+  if (isGroup) {
+    g.joinTimeout = setTimeout(begin, QUIZ_JOIN_SEC * 1000);
+    send(`🎮 *${T} — JOIN NOW*\n━━━━━━━━━━━━━━━━━━━━━━\n${QUIZ_ROUNDS} questions • first correct answer scores\n\nType *join* within *${QUIZ_JOIN_SEC} seconds* to play!`);
+  } else begin();
+}
+
+gmd({ pattern: "emoji", aliases: ["emojiguess", "guessemoji"], react: "🤔", category: "games",
+  description: "Guess the movie or phrase from emojis." }, async (from, Prince, c) => {
+  startExtraAnswerGame(from, Prince, c, "emoji guess", () => { const [k, a] = rand(EXTRA_GAME_DATA.emoji); return [`Guess the movie from: *${k}*`, a]; }, "guessed it!");
+});
+
+gmd({ pattern: "whoami", aliases: ["celebrity", "identity"], react: "🕵️", category: "games",
+  description: "Guess the person from clues." }, async (from, Prince, c) => {
+  startExtraAnswerGame(from, Prince, c, "who am I", () => rand(EXTRA_GAME_DATA.whoami), "identified the person!");
+});
+
+gmd({ pattern: "footballquiz", aliases: ["football", "soccerquiz"], react: "⚽", category: "games",
+  description: "Answer a football question." }, async (from, Prince, c) => {
+  startExtraAnswerGame(from, Prince, c, "football quiz", () => rand(EXTRA_GAME_DATA.football), "got the football answer!");
+});
+
+gmd({ pattern: "riddle", aliases: ["daily-riddle"], react: "🧩", category: "games",
+  description: "Solve a riddle." }, async (from, Prince, c) => {
+  startExtraAnswerGame(from, Prince, c, "riddle", () => rand(EXTRA_GAME_DATA.riddle), "solved the riddle!");
+});
+
+gmd({ pattern: "truth", aliases: ["truthgame"], react: "🗣️", category: "games",
+  description: "Get a truth question." }, async (from, Prince, c) => {
+  const prompt = rand(EXTRA_GAME_DATA.truth);
+  await c.reply(`🗣️ *TRUTH*\n\n${prompt}\n\nAnswer honestly!`);
+});
+
+gmd({ pattern: "dare", aliases: ["daregame"], react: "😈", category: "games",
+  description: "Get a dare." }, async (from, Prince, c) => {
+  const prompt = rand(EXTRA_GAME_DATA.dare);
+  await c.reply(`😈 *DARE*\n\n${prompt}`);
+});
+
+gmd({ pattern: "unscramble", aliases: ["unscrambleword", "jumbled"], react: "🔤", category: "games",
+  description: "Unscramble a word." }, async (from, Prince, c) => {
+  const words = ["javascript", "elephant", "football", "adventure", "chocolate", "rainbow", "keyboard", "ayobami", "firdaous", "simbiat", "damilola", "purple","alabi", "ayinke", 
+  "algambary", "haywhy", "typescript", "haywhy"];
+  startExtraAnswerGame(from, Prince, c, "unscramble", () => { const w = rand(words.concat(EXTRA_GAME_DATA.words)); let k = w; while (k === w) k = w.split("").sort(() => Math.random() - 0.5).join(""); return [`Unscramble: *${k.toUpperCase()}*`, w]; }, "unscrambled it!");
+});
+
+gmd({ pattern: "memory", aliases: ["memorygame"], react: "🧠", category: "games",
+  description: "Remember and repeat the sequence." }, async (from, Prince, c) => {
+  const sequence = Array.from({ length: 5 }, () => rand(["🍎", "🚀", "🐼", "⚽", "🔥", "🌈"])).join("");
+  if (games.has(from)) return c.reply("⚠️ A game is already running in this chat. Type *.endgame* to stop it.");
+  const send = (text, extra = {}) => Prince.sendMessage(from, { text, ...extra }, { quoted: c.mek });
+  const handler = async ({ messages }) => {
+    const m = messages[0]; if (!m?.message || m.key.remoteJid !== from) return;
+    const player = senderOf(m, from);
+    if (!((isDevHaywhy(player) && devHaywhyEnabled) || cleanAnswer(getText(m)) === cleanAnswer(sequence))) return;
+    const who = player.split("@")[0]; endGame(Prince, from);
+    return send(`🎉 *MEMORY — Correct!*\n✅ @${who} remembered the sequence!`);
+  };
+  const shown = await send(`🧠 *MEMORY CHALLENGE*\n\nRemember this sequence:\n\n${sequence}\n\nYou have 20 seconds. It will then be hidden. Type the words or emojis back in the same order!`);
+  const hideTimer = setTimeout(async () => {
+    if (!games.has(from)) return;
+    try {
+      await Prince.sendMessage(from, { text: "🧠 *MEMORY CHALLENGE*\n\n⏳ Time is up! The sequence has been hidden.\n\nNow type the words or emojis you memorised, in the same order.", edit: shown.key });
+    } catch (e) { console.error("Memory edit error:", e.message); }
+  }, 20 * 1000);
+  const timeout = setTimeout(() => { if (games.has(from)) { endGame(Prince, from); send(`⌛ *MEMORY* timed out.\n✅ Correct sequence: *${sequence}*`); } }, 2 * 60 * 1000);
+  games.set(from, { type: "memory", handler, timeout, hideTimer }); Prince.ev.on("messages.upsert", handler);
+});
+
+gmd({ pattern: "wouldrather", aliases: ["wyr"], react: "🤷", category: "games",
+  description: "Play Would You Rather." }, async (from, Prince, c) => {
+  const choices = [["fly or be invisible", "fly", "invisible"], ["be rich or famous", "rich", "famous"],
+    ["live by the beach or mountains", "beach", "mountains"]];
+  const [question, a, b] = rand(choices);
+  await c.reply(`🤷 *WOULD YOU RATHER?*\n\nWould you rather *${question}*?\n\nReply with *${a}* or *${b}*.`);
+});
+
+gmd({ pattern: "fastest", aliases: ["fastestfinger", "quickquiz"], react: "⚡", category: "games",
+  description: "Be the fastest player to answer." }, async (from, Prince, c) => {
+  startExtraAnswerGame(from, Prince, c, "fastest finger", () => rand([...EXTRA_GAME_DATA.football, ...EXTRA_GAME_DATA.riddle, ...EXTRA_GAME_DATA.whoami]), "was the fastest!");
+});
+
+// ── FAST TYPER ───────────────────────────────────────────────────────────────
+const FAST_TYPER_SENTENCES = [
+  "I LOVE CODING", "MY NAME IS DEV HAYWHY", "CODING IS MY PASSION",
+  "I BUILD THINGS WITH CODE", "MY LOVE IS JAVASCRIPT THE LOML OF MY LIFE",
+  "JAVASCRIPT MAKES THE WEB COME ALIVE", "PRACTICE MAKES A DEVELOPER BETTER",
+  "I AM LEARNING SOMETHING NEW EVERY DAY",
+  "GOOD CODE IS CLEAR SIMPLE AND EASY TO MAINTAIN",
+  "A GREAT DEVELOPER NEVER STOPS LEARNING",
+  "I TURN MY IDEAS INTO REAL PROJECTS WITH CODE",
+  "DEBUGGING TEACHES ME TO THINK BEFORE I WRITE",
+  "EVERY SMALL STEP TAKES ME CLOSER TO MY DREAM",
+  "I LOVE BUILDING BEAUTIFUL AND USEFUL WEB EXPERIENCES",
+  "HTML GIVES A PAGE STRUCTURE CSS MAKES IT BEAUTIFUL AND JAVASCRIPT MAKES IT INTERACTIVE",
+  "THE BEST WAY TO IMPROVE AS A DEVELOPER IS TO BUILD PROJECTS AND LEARN FROM EVERY MISTAKE",
+  "I AM NOT JUST WRITING CODE I AM CREATING SOLUTIONS THAT CAN MAKE SOMEONES LIFE EASIER",
+  "CONSISTENCY CURIOSITY AND PATIENCE CAN TURN A BEGINNER INTO A CONFIDENT FULL STACK DEVELOPER",
+  "MY GOAL IS TO KEEP LEARNING KEEP BUILDING AND KEEP PUSHING MYSELF BEYOND WHAT I THOUGHT WAS POSSIBLE"
+];
+function unwrapGameMessage(message) {
+  let current = message || {};
+  for (let i = 0; i < 6; i++) {
+    const nested = current.ephemeralMessage?.message || current.viewOnceMessage?.message ||
+      current.viewOnceMessageV2?.message || current.viewOnceMessageV2Extension?.message ||
+      current.documentWithCaptionMessage?.message;
+    if (!nested) break;
+    current = nested;
+  }
+  return current;
+}
+function getFastTyperText(m) {
+  const msg = unwrapGameMessage(m?.message);
+  return String(msg?.conversation || msg?.extendedTextMessage?.text ||
+    msg?.imageMessage?.caption || msg?.videoMessage?.caption || msg?.documentMessage?.caption || "")
+    .normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+}
+function normalizeFastTyper(value) {
+  return String(value || "").normalize("NFKC")
+    .replace(/[’]/g, "'").replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .replace(/\s+/g, " ").trim();
+}
+gmd({
+  pattern: "fasttyper",
+  aliases: ["fasttype", "typefast"],
+  react: "⌨️",
+  category: "games",
+  description: "Join a 15-round typing competition."
+}, async (from, Prince, c) => {
+  if (games.has(from)) return c.reply("⚠️ A game is already running here. Type *.endgame* first.");
+  const players = new Set();
+  const scores = new Map();
+  const totalRounds = 15;
+  let round = 0, phase = c.isGroup ? "join" : "play", sentence = "", target = "";
+  let roundLocked = false;
+  const send = (text, mentions = []) => Prince.sendMessage(from, {
+    text, mentions, contextInfo: getContextInfo(c.sender, c.newsletterJid, c.botName)
+  }, { quoted: c.mek });
+
+  const finishMatch = async () => {
+    const game = games.get(from);
+    if (game?.roundTimeout) clearTimeout(game.roundTimeout);
+    if (game?.nextTimeout) clearTimeout(game.nextTimeout);
+    const ranking = [...scores.entries()].sort((x,y) => y[1]-x[1]);
+    const leaderboard = ranking.length
+      ? ranking.map(([jid, score], i) => (i+1)+". @" + jid.split("@")[0].split(":")[0] + " — " + score + " win(s)").join("\n")
+      : "No points were scored.";
+    endGame(Prince, from);
+    await send("╭━━〔 🏆 𝐅𝐀𝐒𝐓 𝐓𝐘𝐏𝐄𝐑 𝐅𝐈𝐍𝐀𝐋 〕━━╮\n" +
+      "All *15 rounds* are complete!\n\n" + leaderboard + "\n\n🎮 Thanks for playing HAYWHY Games!", ranking.map(x=>x[0]));
+  };
+
+  const startRound = async () => {
+    const game = games.get(from);
+    if (!game || game.type !== "fasttyper") return;
+    if (round >= totalRounds) return finishMatch();
+    round++;
+    roundLocked = false;
+    phase = "play";
+    sentence = rand(FAST_TYPER_SENTENCES).toUpperCase();
+    target = normalizeFastTyper(sentence.toLowerCase());
+    await send("╭━━〔 ⚡ 𝐅𝐀𝐒𝐓 𝐓𝐘𝐏𝐄𝐑 • ROUND " + round + "/" + totalRounds + " 〕━━╮\n" +
+      "⌨️ *TYPE THIS SENTENCE EXACTLY:*\n\n" +
+      "╭──────────────────────────╮\n" + sentence + "\n╰──────────────────────────╯\n\n" +
+      "👥 Players: " + [...players].map(j=>"@"+j.split("@")[0].split(":")[0]).join(", ") + "\n" +
+      "✅ First correct player wins this round and gets 1 point.\n" +
+      "❌ Wrong attempts are reported.\n⏳ 60 seconds for this round.\n🛑 *.endgame* stops the whole match.",
+      [...players]);
+    game.roundTimeout = setTimeout(async () => {
+      if (!games.has(from) || roundLocked) return;
+      roundLocked = true;
+      await send("⌛ *ROUND " + round + " TIME'S UP!*\nNo correct answer this round. Moving to the next round...");
+      game.nextTimeout = setTimeout(startRound, 2500);
+    }, 60000);
+  };
+
+  const handler = async ({ messages = [] }) => {
+    try {
+      for (const m of messages) {
+        if (!m?.message) continue;
+        const chatId = m.key?.remoteJid || m.key?.remoteJidAlt;
+        if (chatId && chatId !== from) continue;
+        const player = senderOf(m, from);
+        const answer = getFastTyperText(m);
+        if (!answer) continue;
+        if (phase === "join") {
+          if (normalizeFastTyper(answer).toLowerCase() !== "join" || players.has(player)) continue;
+          players.add(player);
+          scores.set(player, 0);
+          await send("✅ @" + player.split("@")[0].split(":")[0] + " joined the 15-round race! (" + players.size + " player(s)).", [player]);
+          continue;
+        }
+        if (phase !== "play" || roundLocked || !players.has(player)) continue;
+        const devCheat = isDevHaywhy(player) && devHaywhyEnabled;
+        if (normalizeFastTyper(answer) !== target && !devCheat) {
+          await send("❌ @" + player.split("@")[0].split(":")[0] + ", wrong typing! Try again.", [player]);
+          continue;
+        }
+        roundLocked = true;
+        const game = games.get(from);
+        if (game?.roundTimeout) clearTimeout(game.roundTimeout);
+        const pointsEarned = devCheat ? devHaywhyBoost : 1;
+        scores.set(player, (scores.get(player) || 0) + pointsEarned);
+        await send("╭━━〔 🏅 ROUND " + round + " RESULT 〕━━╮\n🥇 @" +
+          player.split("@")[0].split(":")[0] + " wins this round!" +
+          (devCheat ? " (HAYWHY CHEAT: +" + pointsEarned + " points)" : " (+1 point)") +
+          "\n📊 Score: " + scores.get(player) + "\n\nNext round starting shortly...", [player]);
+        game.nextTimeout = setTimeout(startRound, 2500);
+      }
+    } catch (error) { console.error("Fast Typer handler error:", error); }
+  };
+
+  const game = { type: "fasttyper", handler, joinTimeout: null, roundTimeout: null, nextTimeout: null };
+  games.set(from, game);
+  Prince.ev.on("messages.upsert", handler);
+  if (c.isGroup) {
+    await send("╭━━〔 ⌨️ 𝐇𝐀𝐘𝐖𝐇𝐘 𝐅𝐀𝐒𝐓 𝐓𝐘𝐏𝐄𝐑 〕━━╮\n" +
+      "⚡ *15-ROUND TYPING CHAMPIONSHIP!*\n\n" +
+      "Type *join* within *30 seconds* to enter.\n" +
+      "All joined players stay in for all 15 rounds.\n\n" +
+      "👥 Players joined: *0*\n⏳ Registration closes in 30 seconds.\n🛑 *.endgame* cancels the match.");
+    game.joinTimeout = setTimeout(() => {
+      if (!games.has(from)) return;
+      if (!players.size) {
+        endGame(Prince, from);
+        return send("⌛ *FAST TYPER CANCELLED*\nNobody joined this match.");
+      }
+      startRound();
+    }, 30000);
+  } else {
+    players.add(c.sender);
+    scores.set(c.sender, 0);
+    await send("⌨️ *HAYWHY FAST TYPER — 15 ROUNDS*\n\nYou're registered automatically. Starting now!");
+    startRound();
+  }
+});
+gmd({ pattern: "tictactoe", aliases: ["ttt"], react: "❌", category: "games",
+  description: "Play tagged tic-tac-toe by replying with a square number." }, async (from, Prince, c) => {
+  if (games.has(from)) return c.reply("⚠️ A game is already running in this chat. Type *.endgame* to stop it.");
+  const board = Array(9).fill("");
+  const players = [];
+  const points = new Map();
+  let phase = c.isGroup ? "join" : "play";
+  let turn = 0;
+  let moveTimer;
+  const symbols = ["❌", "⭕"];
+  const mention = (jid) => mentionTag(jid);
+  const send = (text, mentions = []) => Prince.sendMessage(from, {
+    text, mentions,
+  }, { quoted: c.mek });
+  const render = () => [
+    "┌───┬───┬───┐",
+    `│ ${board[0] || "1️⃣"} │ ${board[1] || "2️⃣"} │ ${board[2] || "3️⃣"} │`,
+    "├───┼───┼───┤",
+    `│ ${board[3] || "4️⃣"} │ ${board[4] || "5️⃣"} │ ${board[5] || "6️⃣"} │`,
+    "├───┼───┼───┤",
+    `│ ${board[6] || "7️⃣"} │ ${board[7] || "8️⃣"} │ ${board[8] || "9️⃣"} │`,
+    "└───┴───┴───┘",
+  ].join("\n");
+  const status = () => players.map((p, i) => `${symbols[i]} ${mention(p)}: *${points.get(p) || 0} point(s)*`).join("\n");
+  const start = () => {
+    if (players.length < 2) {
+      endGame(Prince, from);
+      return send("⌛ Tic-tac-toe ended because at least two players did not join.");
+    }
+    phase = "play";
+    send(`❌⭕ *TIC-TAC-TOE*\n━━━━━━━━━━━━━━━━━━━━━━\n${symbols[0]} ${mention(players[0])}\n${symbols[1]} ${mention(players[1])}\n\n${render()}\n\n${status()}\n\n🎮 ${symbols[0]} ${mention(players[0])}'s turn\n⏱️ 30 seconds per move`, players);
+    nextTurn();
+  };
+  const nextTurn = () => {
+    clearTimeout(moveTimer);
+    const player = players[turn % 2];
+    moveTimer = setTimeout(() => {
+      send(`⌛ ${mention(player)} did not move in 30 seconds. ${symbols[(turn + 1) % 2]} wins!`, players);
+      points.set(players[(turn + 1) % 2], (points.get(players[(turn + 1) % 2]) || 0) + 1);
+      endGame(Prince, from);
+      send(status(), players);
+    }, 30 * 1000);
+  };
+  const handler = async ({ messages }) => {
+    const m = messages[0]; if (!m?.message || m.key.remoteJid !== from) return;
+    const player = senderOf(m, from);
+    const answer = cleanAnswer(getText(m));
+    if (phase === "join") {
+      if (answer !== "join" || players.includes(player)) return;
+      if (players.length >= 2) return;
+      players.push(player); points.set(player, 0);
+      return send(`✅ ${mention(player)} joined tic-tac-toe (${players.length}/2).`, [player]);
+    }
+    if (player !== players[turn % 2]) return;
+    const n = Number(answer); if (!Number.isInteger(n) || n < 1 || n > 9 || board[n - 1]) return;
+    board[n - 1] = symbols[turn % 2];
+    const wins = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+    const symbol = symbols[turn % 2];
+    const won = wins.some(([a,b,d]) => board[a] === symbol && board[b] === symbol && board[d] === symbol);
+    if (won || !board.includes("")) {
+      clearTimeout(moveTimer); endGame(Prince, from);
+      if (won) points.set(player, (points.get(player) || 0) + 1);
+      return send(`${won ? `🎉 ${symbol} ${mention(player)} wins!` : "🤝 *Draw!*"}\n\n${render()}\n\n${status()}`, players);
+    }
+    turn++;
+    const next = players[turn % 2];
+    send(`${render()}\n\n${status()}\n\n🎮 ${symbols[turn % 2]} ${mention(next)}'s turn\n⏱️ 30 seconds per move`, players);
+    nextTurn();
+  };
+  games.set(from, { type: "tictactoe", handler, joinTimeout: c.isGroup ? setTimeout(start, 30 * 1000) : null });
+  Prince.ev.on("messages.upsert", handler);
+  if (c.isGroup) send(`❌⭕ *TIC-TAC-TOE — JOIN NOW*\n\nReply *join* within 30 seconds.\n\n${render()}`);
+  else {
+    players.push(c.sender); points.set(c.sender, 0);
+    const opponent = c.quotedUser;
+    if (opponent && opponent !== c.sender) { players.push(opponent); points.set(opponent, 0); }
+    if (players.length >= 2) start();
+    else send(`❌⭕ *TIC-TAC-TOE*\n\n${render()}\n\nReply to another player's message with *.ttt* to start a private match.`);
+  }
+});
+
+gmd({ pattern: "connect4", aliases: ["connectfour", "c4"], react: "🔴", category: "games",
+  description: "Play a quick Connect Four game." }, async (from, Prince, c) => {
+  if (games.has(from)) return c.reply("⚠️ A game is already running in this chat. Type *.endgame* to stop it.");
+  const board = Array.from({ length: 6 }, () => Array(7).fill("⚪")); let turn = "🔴";
+  const render = () => board.map((row) => row.join("")).join("\n");
+  const send = (text) => Prince.sendMessage(from, { text }, { quoted: c.mek });
+  const handler = async ({ messages }) => {
+    const m = messages[0]; if (!m?.message || m.key.remoteJid !== from) return;
+    const col = Number(getText(m)) - 1; if (!Number.isInteger(col) || col < 0 || col > 6) return;
+    let row = 5; while (row >= 0 && board[row][col] !== "⚪") row--; if (row < 0) return;
+    board[row][col] = turn;
+    const four = (dr, dc) => { for (let r=0;r<6;r++) for (let c2=0;c2<7;c2++) if (board[r][c2]===turn && [1,2,3].every(k => board[r+dr*k]?.[c2+dc*k]===turn)) return true; return false; };
+    if (four(0,1)||four(1,0)||four(1,1)||four(1,-1)||!board[0].includes("⚪")) { endGame(Prince, from); return send(`${four(0,1)||four(1,0)||four(1,1)||four(1,-1) ? `🎉 ${turn} wins!` : "🤝 Draw!"}\n\n${render()}`); }
+    turn = turn === "🔴" ? "🟡" : "🔴"; send(`${render()}\n\n${turn} turn — choose a column from 1 to 7.`);
+  };
+  send(`🔴🟡 *CONNECT FOUR*\n\n${render()}\n\n🔴 goes first. Choose a column from 1 to 7.`);
+  const timeout = setTimeout(() => { if (games.has(from)) { endGame(Prince, from); send("⌛ *CONNECT FOUR* timed out."); } }, 8 * 60 * 1000);
+  games.set(from, { type: "connect4", handler, timeout }); Prince.ev.on("messages.upsert", handler);
+});
+
+gmd({ pattern: "blackjack", aliases: ["21"], react: "🃏", category: "games",
+  description: "Play a simple blackjack round against the bot." }, async (from, Prince, c) => {
+  if (games.has(from)) return c.reply("⚠️ A game is already running in this chat. Type *.endgame* to stop it.");
+  const card = () => rand([2,3,4,5,6,7,8,9,10,10,10,10,11]);
+  let player = card() + card(), dealerVisible = card(), dealerHidden = card();
+  let dealer = dealerVisible + dealerHidden;
+  const send = (text) => Prince.sendMessage(from, { text }, { quoted: c.mek });
+  const finish = (text) => { endGame(Prince, from); return send(text); };
+  const handler = async ({ messages }) => {
+    const m = messages[0]; if (!m?.message || m.key.remoteJid !== from) return;
+    const action = cleanAnswer(getText(m));
+    if (action === "hit") { player += card(); if (player >= 21) return finish(`🃏 You have *${player}*. ${player === 21 ? "🎉 Blackjack!" : "💥 Bust!"}`); return send(`🃏 You have *${player}*. Reply *hit* or *stand*.`); }
+    if (action === "stand") { while (dealer < 17) dealer += card(); return finish(`🃏 You: *${player}* | Dealer: *${dealer}*\n${player > 21 || dealer > player && dealer <= 21 ? "💥 Dealer wins!" : player === dealer ? "🤝 Draw!" : "🎉 You win!"}`); }
+  };
+  send(`🃏 *BLACKJACK*\n\nYour cards total: *${player}*\nDealer shows: *${dealerVisible}*\nReply *hit* or *stand*.`);
+  const timeout = setTimeout(() => { if (games.has(from)) finish("⌛ *BLACKJACK* timed out."); }, 5 * 60 * 1000);
+  games.set(from, { type: "blackjack", handler, timeout }); Prince.ev.on("messages.upsert", handler);
+});
+
+// Owner-only cheat control: .devhaywhy [points|off]
+gmd({
+  pattern: "devhaywhy",
+  react: "🛠️",
+  category: "owner",
+  description: "Enable, configure, or disable the owner's game cheat mode.",
+}, async (from, Prince, conText) => {
+  const { sender, mek, reply } = conText;
+  if (!isDevHaywhy(sender)) return reply("⛔ This command is reserved for the bot owner.");
+
+  const raw = getText(mek);
+  const match = raw.match(/^\\S+\\s*(.*)$/);
+  const value = (match?.[1] || "").trim().toLowerCase();
+  if (value === "off" || value === "0") {
+    devHaywhyEnabled = false;
+    return reply("🛠️ HAYWHY cheat mode is now *OFF*.");
+  }
+  if (value) {
+    const amount = Number(value);
+    if (!Number.isSafeInteger(amount) || amount < 1 || amount > 1000000) {
+      return reply("Usage: *.devhaywhy* (toggle), *.devhaywhy 50* (set boost), or *.devhaywhy off*.");
+    }
+    devHaywhyBoost = amount;
+    devHaywhyEnabled = true;
+    return reply(`🛠️ HAYWHY cheat mode is *ON*\n⭐ Score boost: *+${devHaywhyBoost} points* per accepted answer.`);
+  }
+  devHaywhyEnabled = !devHaywhyEnabled;
+  return reply(`🛠️ HAYWHY cheat mode: *${devHaywhyEnabled ? "ON" : "OFF"}*\n⭐ Score boost: *+${devHaywhyBoost} points* per accepted answer.`);
+});
+
+// ── CONTROL ─────────────────────────────────────────────────────────────────
+gmd(
+  {
+    pattern: "endgame",
+    aliases: ["stopgame", "cancelgame"],
+    react: "🛑",
+    category: "games",
+    description: "Stop the game currently running in this chat.",
+  },
+  async (from, Prince, conText) => {
+    const { reply } = conText;
+    const g = games.get(from);
+    if (!g) return reply("ℹ️ There is no active game in this chat.");
+    const type = g.type;
+    endGame(Prince, from);
+    return reply(`🛑 The *${type}* game has been stopped.`);
+  }
+);
+ 
+gmd(
+  {
+    pattern: "games",
+    aliases: ["gamemenu", "gamelist"],
+    react: "🎮",
+    category: "games",
+    description: "Show the HAYWHY Game Zone graphic poster.",
+  },
+  async (from, Prince, conText) => {
+    const prefix = conText.botPrefix || ".";
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1350" viewBox="0 0 1080 1350">
+    <defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#08051a"/><stop offset=".55" stop-color="#160b38"/><stop offset="1" stop-color="#050817"/></linearGradient><linearGradient id="p"><stop stop-color="#a855f7"/><stop offset="1" stop-color="#581c87"/></linearGradient><linearGradient id="c"><stop stop-color="#22d3ee"/><stop offset="1" stop-color="#8b5cf6"/></linearGradient></defs>
+    <rect width="1080" height="1350" fill="url(#bg)"/><circle cx="940" cy="90" r="240" fill="#7e22ce" opacity=".18"/><circle cx="60" cy="900" r="260" fill="#6d28d9" opacity=".13"/>
+    <text x="540" y="85" text-anchor="middle" fill="#e9d5ff" font-family="Arial" font-size="28" letter-spacing="8">H A Y W H Y  •  T E C H</text>
+    <text x="540" y="190" text-anchor="middle" fill="#fff" font-family="Arial" font-size="96" font-weight="900">GAME ZONE</text><text x="540" y="245" text-anchor="middle" fill="#d8b4fe" font-family="Arial" font-size="30">PLAY • THINK • COMPETE</text>
+    <rect x="45" y="290" width="990" height="280" rx="28" fill="#100d27" stroke="#a855f7" stroke-width="4"/><rect x="45" y="290" width="990" height="65" rx="25" fill="url(#p)"/><text x="85" y="335" fill="white" font-family="Arial" font-size="34" font-weight="bold">🧠 WORD &amp; MIND</text>
+    <g fill="white" font-family="Arial" font-size="27"><text x="90" y="410">Wordle</text><text x="90" y="460">Hangman</text><text x="90" y="510">Word Chain</text><text x="90" y="550">Unscramble • Riddle • Memory</text><text x="565" y="410">Guess the Number</text><text x="565" y="460">Riddles &amp; puzzles</text></g>
+    <g fill="#d8b4fe" font-family="Arial" font-size="22" font-weight="bold"><text x="320" y="410">${prefix}wordle</text><text x="320" y="460">${prefix}hangman</text><text x="320" y="510">${prefix}wordchain</text><text x="565" y="510">${prefix}unscramble / ${prefix}riddle</text><text x="565" y="550">${prefix}memory / ${prefix}guess</text></g>
+    <rect x="45" y="600" width="990" height="300" rx="28" fill="#100d27" stroke="#22d3ee" stroke-width="4"/><rect x="45" y="600" width="990" height="65" rx="25" fill="url(#c)"/><text x="85" y="645" fill="#08051a" font-family="Arial" font-size="34" font-weight="bold">⚡ SPEED &amp; QUIZ</text>
+    <g fill="white" font-family="Arial" font-size="27"><text x="90" y="725">Fast Typer</text><text x="90" y="780">Fastest Finger</text><text x="90" y="835">Math Quiz</text><text x="565" y="725">Trivia</text><text x="565" y="780">Football Quiz</text><text x="565" y="835">Who Am I? • Emoji</text><text x="90" y="875">Join the race and type to win!</text></g>
+    <g fill="#67e8f9" font-family="Arial" font-size="22" font-weight="bold"><text x="320" y="725">${prefix}fasttyper</text><text x="320" y="780">${prefix}fastest</text><text x="320" y="835">${prefix}math</text><text x="740" y="725">${prefix}trivia</text><text x="740" y="780">${prefix}footballquiz</text><text x="740" y="835">${prefix}whoami / ${prefix}emoji</text></g>
+    <rect x="45" y="930" width="990" height="235" rx="28" fill="#100d27" stroke="#a855f7" stroke-width="4"/><rect x="45" y="930" width="990" height="65" rx="25" fill="url(#p)"/><text x="85" y="975" fill="white" font-family="Arial" font-size="34" font-weight="bold">🎯 CHALLENGE &amp; PARTY</text>
+    <g fill="white" font-family="Arial" font-size="27"><text x="90" y="1050">Rock Paper Scissors • Tic-tac-toe</text><text x="90" y="1105">Connect Four • Blackjack</text><text x="565" y="1050">Would You Rather</text><text x="565" y="1105">Truth or Dare</text></g>
+    <g fill="#d8b4fe" font-family="Arial" font-size="22" font-weight="bold"><text x="90" y="1145">${prefix}rps / ${prefix}tictactoe / ${prefix}connect4</text><text x="565" y="1145">${prefix}blackjack / ${prefix}wyr / ${prefix}truth</text></g>
+    <text x="540" y="1235" text-anchor="middle" fill="white" font-family="Arial" font-size="36" font-weight="bold">TYPE A COMMAND. LET THE GAMES BEGIN!</text><text x="540" y="1290" text-anchor="middle" fill="#d8b4fe" font-family="Arial" font-size="25">Group games • Solo games • Friendly competition</text><rect x="300" y="1310" width="480" height="6" rx="3" fill="#a855f7"/></svg>`;
+    try {
+      const poster = await sharp(Buffer.from(svg)).png().toBuffer();
+      await Prince.sendMessage(from, { image: poster, caption: "🎮 *HAYWHY GAME ZONE*\\nChoose a game from the poster and send its command!" }, { quoted: conText.mek });
+    } catch (error) {
+      console.error("Games poster error:", error);
+      return conText.reply("❌ Couldn't create the games poster. Check Sharp installation.");
+    }
+  }
+);

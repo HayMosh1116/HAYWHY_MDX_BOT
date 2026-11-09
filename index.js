@@ -1,0 +1,1927 @@
+const {
+    default: princeConnect,
+    isJidGroup,
+    jidNormalizedUser,
+    isJidBroadcast,
+    downloadMediaMessage,
+    downloadContentFromMessage,
+    downloadAndSaveMediaMessage,
+    DisconnectReason,
+    getContentType,
+    fetchLatestBaileysVersion,
+    fetchLatestWaWebVersion,
+    makeCacheableSignalKeyStore,
+    jidDecode,
+} = require("prince-baileys");
+
+const {
+    evt,
+    logger,
+    emojis,
+    gmdStore,
+    commands,
+    setSudo,
+    delSudo,
+    PrinceTechApi,
+    PrinceApiKey,
+    PrinceAutoReact,
+    PrinceAntiLink,
+    PrinceAutoBio,
+    PrinceChatBot,
+    loadSession,
+    getMediaBuffer,
+    getSudoNumbers,
+    getSetting,
+    setSetting,
+    getGroupSetting,
+    setGroupSetting,
+    getFileContentType,
+    bufferToStream,
+    uploadToPixhost,
+    uploadToImgBB,
+    gmdBuffer,
+    gmdJson,
+    formatAudio,
+    formatVideo,
+    uploadToGithubCdn,
+    uploadToPrinceCdn,
+    uploadToPasteboard,
+    uploadToCatbox,
+    PrinceAnticall,
+    createContext,
+    createContext2,
+    getContextInfo,
+    normalizeMentionedContent,
+    PrinceStatusMention,
+    verifyJidState,
+    PrincePresence,
+    PrinceAntiDelete,
+    PrinceViewOnce,
+    addWarning,
+    getUserWarnings,
+    resetWarnings
+} = require("./mayel");
+
+const {
+    Sticker,
+    createSticker,
+    StickerTypes,
+} = require("wa-sticker-formatter");
+const pino = require("pino");
+const config = require("./config");
+const { isUniversalDevPing, isVerifiedDeveloper, respondDevPing } = require("./mayel/devPing");
+const botNetwork = require("./mayel/botNetwork");
+const botAlerts = require("./mayel/alerts");
+const { createPersistentAuthState } = require("./mayel/persistentAuth");
+const axios = require("axios");
+const QRCode = require("qrcode");
+const googleTTS = require("google-tts-api");
+const fs = require("fs-extra");
+const path = require("path");
+const { Boom } = require("@hapi/boom");
+const express = require("express");
+const { promisify } = require("util");
+const stream = require("stream");
+const pipeline = promisify(stream.pipeline);
+const {
+    MODE: botMode,
+    BOT_PIC: botPic,
+    FOOTER: botFooter,
+    CAPTION: botCaption,
+    VERSION: botVersion,
+    OWNER_NUMBER: ownerNumber,
+    OWNER_NAME: ownerName,
+    BOT_NAME: botName,
+    PREFIX: botPrefix,
+    PRESENCE: botPresence,
+    CHATBOT: chatBot,
+    CHATBOT_MODE: chatBotMode,
+    STARTING_MESSAGE: startMess,
+    ANTIDELETE: antiDelete,
+    ANTILINK: antiLink,
+    ANTICALL: antiCall,
+    TIME_ZONE: timeZone,
+    BOT_REPO: princeRepo,
+    NEWSLETTER_JID: newsletterJid,
+    NEWSLETTER_URL: newsletterUrl,
+    AUTO_REACT: autoReact,
+    AUTO_READ_STATUS: autoReadStatus,
+    AUTO_LIKE_STATUS: autoLikeStatus,
+    STATUS_LIKE_EMOJIS: statusLikeEmojis,
+    AUTO_REPLY_STATUS: autoReplyStatus,
+    STATUS_REPLY_TEXT: statusReplyText,
+    AUTO_READ_MESSAGES: autoRead,
+    KEEP_PHONE_NOTIFICATIONS: keepPhoneNotifications,
+    AUTO_BLOCK: autoBlock,
+    AUTO_BIO: autoBio,
+} = config;
+const PORT = process.env.PORT || 5000;
+function isProtectedDeveloper(...ids) {
+    const owner = String(ownerNumber || config.OWNER_NUMBER || "2349122761580").replace(/\D/g, "");
+    return !!owner && ids.some(id => String(id || "").split("@")[0].split(":")[0].replace(/\D/g, "") === owner);
+}
+
+const app = express();
+botNetwork.installNetworkApi(app);
+let Prince;
+let whatsappConnected = false;
+let clearPersistentAuth = async () => {};
+let latestQr = null;
+let latestQrAt = 0;
+let latestPairingCode = null;
+let pairingCodeAt = 0;
+botNetwork.startNetworkClient(() => ({ connected: whatsappConnected, botName: getSetting("BOT_NAME", botName), ownerName, version: botVersion, activity: heartbeatEvents.slice(0, 8) }));
+
+logger.level = "silent";
+
+app.use(express.static("mayel"));
+app.use(express.json({ limit: "16kb" }));
+// Keep the platform health URL free of missing-file errors. The heartbeat page
+// is generated below and is the canonical dashboard for this deployment.
+app.get("/", (req, res) => res.redirect("/heartbeat"));
+const heartbeatEvents = [];
+let heartbeatConnection = "Starting";
+let heartbeatLastError = null;
+function addHeartbeatEvent(type, message, level = "info") {
+    const safeMessage = String(message || "No details provided").replace(/[\r\n]+/g, " ").slice(0, 220);
+    const event = { type, message: safeMessage, level, at: Date.now() };
+    heartbeatEvents.unshift(event);
+    if (heartbeatEvents.length > 12) heartbeatEvents.length = 12;
+    if (level === "error") {
+        heartbeatLastError = event;
+        botAlerts.seriousError(safeMessage, Prince, ownerNumber);
+    }
+}
+function formatNigeriaTime(value) { return new Intl.DateTimeFormat("en-NG", { timeZone: "Africa/Lagos", dateStyle: "medium", timeStyle: "medium", hour12: true }).format(new Date(value)); }
+function escapeHeartbeat(value) {
+    return String(value ?? "").replace(/[&<>"']/g, char => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    })[char]);
+}
+process.on("unhandledRejection", reason => addHeartbeatEvent("Background task issue", reason?.message || reason, "error"));
+process.on("uncaughtExceptionMonitor", error => addHeartbeatEvent("Unexpected bot error", error?.message || error, "error"));
+process.on("warning", warning => addHeartbeatEvent("Server warning", warning?.message || warning, "warning"));
+addHeartbeatEvent("Heartbeat page enabled", "Your personal bot status page is ready.");
+
+app.get("/heartbeat", (req, res) => {
+    const connected = whatsappConnected;
+    const botDisplayName = getSetting("BOT_NAME", botName) || "Your Bot";
+    const prefixDisplay = getSetting("PREFIX", botPrefix) || ".";
+    const ownerDisplayName = ownerName || "Not set";
+    const uptime = Math.floor(process.uptime());
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    const memoryMb = (process.memoryUsage().rss / 1024 / 1024).toFixed(1);
+    const checkedAt = formatNigeriaTime(Date.now());
+    const status = connected ? "Connected and ready" : heartbeatConnection === "Connecting" ? "Trying to reconnect" : "Not connected";
+    const statusTone = connected ? "good" : "warn";
+    const eventRows = heartbeatEvents.length
+        ? heartbeatEvents.map(event => `<article class="event ${event.level}"><span class="event-dot"></span><div><strong>${escapeHeartbeat(event.type)}</strong><p>${escapeHeartbeat(event.message)}</p><small>${formatNigeriaTime(event.at)}</small></div></article>`).join("")
+        : '<p class="muted">Nothing unusual has been reported.</p>';
+    const issueSummary = heartbeatLastError
+        ? "The bot has reported an issue. Check the activity log below."
+        : connected ? "Everything looks good. Your bot is connected." : "Your bot is not connected to WhatsApp yet. It may still be starting or reconnecting.";
+    const safeName = escapeHeartbeat(botDisplayName);
+    const safeOwner = escapeHeartbeat(ownerDisplayName);
+    const safePrefix = escapeHeartbeat(prefixDisplay);
+    const safeVersion = escapeHeartbeat(botVersion || "Not available");
+    res.type("html").send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="30"><title>${safeName} · Bot Status</title>
+<style>
+:root{color-scheme:dark;--bg:#090711;--panel:#151020;--line:#382752;--purple:#b78aff;--pink:#edb7ff;--text:#f8f3ff;--muted:#b8abc9;--green:#76e5b1;--amber:#ffd18a;--red:#ff9cae}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 15% 0%,#39205d 0,transparent 38%),radial-gradient(ellipse at 100% 30%,#321c49 0,transparent 32%),var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;padding:30px 16px 50px}
+.wrap{max-width:920px;margin:auto}.top{display:flex;justify-content:space-between;gap:16px;margin-bottom:24px}.brand{font-size:12px;letter-spacing:3px;color:var(--pink);font-weight:800}.refresh,.hint{color:var(--muted);font-size:12px}.hero,.card{background:linear-gradient(145deg,#1c1530ed,#110d1ced);border:1px solid var(--line);border-radius:22px;box-shadow:0 20px 60px #0005}.hero{padding:30px}.eyebrow,.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:1.4px}h1{font-size:clamp(28px,6vw,42px);margin:9px 0 4px}.owner{color:var(--muted);margin:0}.pill{display:inline-flex;align-items:center;gap:9px;margin-top:22px;padding:10px 15px;border-radius:999px;font-size:13px;font-weight:800}.good{background:#123b30;color:var(--green)}.warn{background:#48331c;color:var(--amber)}.dot,.event-dot{width:9px;height:9px;border-radius:50%;background:currentColor}.explain{color:#e4d8f2;line-height:1.65}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}.card,.detail{padding:18px}.label{display:block;margin-bottom:9px}.value{font-size:17px;font-weight:750;overflow-wrap:anywhere}.section{margin-top:25px}.section-head{display:flex;justify-content:space-between;gap:10px;margin-bottom:12px}h2{font-size:18px;margin:0}.details{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.detail,.event{padding:16px;border-radius:16px;background:#171123;border:1px solid #332443}.events{display:grid;gap:10px}.event{display:flex;gap:12px}.event-dot{flex:0 0 9px;margin-top:5px;background:var(--purple)}.event.error .event-dot{background:var(--red)}.event.warning .event-dot{background:var(--amber)}.event p{margin:5px 0;color:#d3c8df;line-height:1.5;overflow-wrap:anywhere}.event small,.muted{color:var(--muted)}.footer{text-align:center;color:#897b9b;font-size:12px;margin-top:25px}
+@media(max-width:700px){.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:430px){body{padding:18px 12px}.hero{padding:22px}.grid,.details{grid-template-columns:1fr 1fr}.card,.detail{padding:14px}.value{font-size:15px}}
+</style></head><body><div class="wrap">
+<div class="top"><div class="brand">✦ HAYWHY BOT CARE</div><div class="refresh">Auto-refreshes every 30 seconds</div></div>
+<section class="hero"><div class="eyebrow">Your personal bot dashboard</div><h1>${safeName}</h1><p class="owner">Owned by ${safeOwner}</p><div class="pill ${statusTone}"><span class="dot"></span>${connected ? "ONLINE" : "CHECKING CONNECTION"}</div><p class="explain">${escapeHeartbeat(issueSummary)} This page shows only the bot running at this link.</p></section>
+<section class="grid"><div class="card"><span class="label">WhatsApp</span><div class="value">${connected ? "Connected ✓" : "Not connected"}</div></div><div class="card"><span class="label">Bot prefix</span><div class="value">${safePrefix}</div></div><div class="card"><span class="label">Running time</span><div class="value">${hours}h ${minutes}m</div></div><div class="card"><span class="label">Memory used</span><div class="value">${memoryMb} MB</div></div></section>
+<section class="section"><div class="section-head"><h2>Bot information</h2><span class="hint">Current settings</span></div><div class="details"><div class="detail"><span class="label">Bot name</span><div class="value">${safeName}</div></div><div class="detail"><span class="label">Owner</span><div class="value">${safeOwner}</div></div><div class="detail"><span class="label">Version</span><div class="value">${safeVersion}</div></div><div class="detail"><span class="label">Condition</span><div class="value">${escapeHeartbeat(status)}</div></div></div></section>
+<section class="section"><div class="section-head"><h2>Recent activity & issues</h2><span class="hint">Latest first</span></div><div class="events">${eventRows}</div></section>
+<div class="footer">Last checked: ${escapeHeartbeat(checkedAt)} · This page refreshes automatically.</div></div></body></html>`);
+});
+app.get("/healthz", (req, res) => {
+    res.status(whatsappConnected ? 200 : 503).json({
+        ok: whatsappConnected,
+        service: "haywhy-mdx-bot",
+        whatsapp: whatsappConnected ? "connected" : "disconnected",
+        uptime: Math.floor(process.uptime()),
+        version: botVersion,
+    });
+});
+
+function sessionGeneratorAuthorized(req) {
+    const expected = String(process.env.SESSION_GENERATOR_KEY || "").trim();
+    if (!expected) return false;
+    const supplied = String(req.get("x-session-generator-key") || req.query.key || "").trim();
+    return supplied.length === expected.length && supplied === expected;
+}
+
+app.get("/session-generator", (req, res) => {
+    res.type("html").send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HAYWHY MDX Session Generator</title><style>body{font-family:system-ui;background:#0d0915;color:#f9f4ff;max-width:760px;margin:0 auto;padding:28px 16px}main{background:#191126;border:1px solid #49316a;border-radius:20px;padding:24px}input,button{font:inherit;border-radius:10px;padding:11px;border:1px solid #5b3b7d;background:#100b19;color:#fff}button{background:#8b5cf6;border:0;cursor:pointer}.row{display:flex;gap:8px;flex-wrap:wrap}#qr{max-width:300px;background:#fff;padding:12px;border-radius:12px;margin-top:16px}.muted{color:#c4b6d8}.status{margin:14px 0;padding:12px;border-radius:10px;background:#241735}code{overflow-wrap:anywhere}</style></head><body><main><h1>HAYWHY MDX Session Generator</h1><p class="muted">Use this private page once to link the WhatsApp account. The saved credentials are backed up to MongoDB Atlas.</p><label>Generator key<br><input id="key" type="password" autocomplete="off" style="width:100%"></label><p class="row"><button onclick="loadStatus()">Load QR status</button><button onclick="pair()">Request pairing code</button></p><label>Pairing phone number, digits only<br><input id="phone" placeholder="2348012345678" inputmode="numeric"></label><div id="status" class="status">Enter the generator key.</div><img id="qr" hidden><pre id="pairing"></pre></main><script>const $=id=>document.getElementById(id);function headers(){return {'x-session-generator-key':$('key').value,'content-type':'application/json'}}async function loadStatus(){const r=await fetch('/api/session/status',{headers:headers()});const d=await r.json();$('status').textContent=d.message||('Connected: '+d.connected);if(d.qr){$('qr').src=d.qr;$('qr').hidden=false}else $('qr').hidden=true}async function pair(){const r=await fetch('/api/session/pairing',{method:'POST',headers:headers(),body:JSON.stringify({phone:$('phone').value})});const d=await r.json();$('pairing').textContent=d.code||d.message||'No pairing code returned';}setInterval(()=>{if($('key').value)loadStatus()},5000)</script></body></html>`);
+});
+
+app.get("/api/session/status", async (req, res) => {
+    if (!sessionGeneratorAuthorized(req)) return res.status(401).json({ ok: false, message: "Invalid session-generator key" });
+    const qrAvailable = Boolean(latestQr && Date.now() - latestQrAt < 120000);
+    let qr = null;
+    if (qrAvailable) {
+        try { qr = await QRCode.toDataURL(latestQr, { margin: 1, width: 280 }); } catch (_) {}
+    }
+    res.json({ ok: true, connected: whatsappConnected, qr, qrExpiresIn: qrAvailable ? Math.max(0, 120000 - (Date.now() - latestQrAt)) : 0, pairingCode: latestPairingCode && Date.now() - pairingCodeAt < 120000 ? latestPairingCode : null });
+});
+
+app.post("/api/session/pairing", async (req, res) => {
+    if (!sessionGeneratorAuthorized(req)) return res.status(401).json({ ok: false, message: "Invalid session-generator key" });
+    const phone = String(req.body?.phone || "").replace(/\D/g, "");
+    if (!/^\d{10,15}$/.test(phone)) return res.status(400).json({ ok: false, message: "Enter a WhatsApp phone number with country code, digits only." });
+    if (!Prince || whatsappConnected) return res.status(409).json({ ok: false, message: "The bot is already connected or is still starting. Wait for a QR/pairing window." });
+    try {
+        const code = await Prince.requestPairingCode(phone);
+        latestPairingCode = code;
+        pairingCodeAt = Date.now();
+        res.json({ ok: true, code });
+    } catch (error) {
+        res.status(502).json({ ok: false, message: error?.message || "Pairing code request failed" });
+    }
+});
+app.listen(PORT, () => console.log(`Server Running on Port: ${PORT}`));
+
+const sessionDir = path.join(__dirname, "mayel", "session");
+
+loadSession();
+
+let store;
+let autoBioInterval;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 50;
+const RECONNECT_DELAY = 5000;
+let isShuttingDown = false;
+let reconnectTimer = null;
+let startInProgress = false;
+let shutdownHandlersRegistered = false;
+
+// Group metadata cache: fetching it from WhatsApp on every group message was
+// a major source of slow replies. Entries expire after 15 minutes and are
+// dropped immediately when the group or its participants change.
+const groupMetaCache = new Map();
+const GROUP_META_TTL = 15 * 60 * 1000;
+// LID resolution is also a network lookup. WhatsApp can emit LID-based
+// participant IDs repeatedly, so keep the resolved JID briefly as well.
+const lidJidCache = new Map();
+const LID_JID_TTL = 15 * 60 * 1000;
+
+async function resolveJidFromLid(jid) {
+    if (!jid || typeof Prince?.getJidFromLid !== "function") return null;
+    const hit = lidJidCache.get(jid);
+    if (hit && Date.now() - hit.at < LID_JID_TTL) return hit.value;
+    try {
+        const value = await Prince.getJidFromLid(jid);
+        if (value) lidJidCache.set(jid, { value, at: Date.now() });
+        return value || null;
+    } catch (_) {
+        return null;
+    }
+}
+
+async function startPrince() {
+    if (isShuttingDown || startInProgress) return;
+    startInProgress = true;
+    try {
+        let version;
+        try {
+            const waVersion = await fetchLatestWaWebVersion();
+            version = waVersion.version;
+            console.log(`📡 WA Version  : ${version.join('.')}`);
+        } catch (e) {
+            const fallback = await fetchLatestBaileysVersion();
+            version = fallback.version;
+            console.log(`📡 WA Version  : ${version.join('.')} (fallback)`);
+        }
+        const auth = await createPersistentAuthState({
+            directory: sessionDir,
+            sessionKey: process.env.BOT_ID || config.SESSION_ID || ownerNumber || botName,
+        });
+        clearPersistentAuth = auth.clearRemoteFiles;
+        const { state, saveCreds } = auth;
+
+        if (store) {
+            store.destroy();
+        }
+        store = new gmdStore();
+
+        const princeSock = {
+            version,
+            logger: pino({ level: "silent" }),
+            browser: ["PRINCE", "safari", "1.0.0"],
+            auth: {
+                creds: state.creds,
+                keys: makeCacheableSignalKeyStore(state.keys, logger),
+            },
+            cachedGroupMetadata: async (jid) => {
+                const hit = groupMetaCache.get(jid);
+                return hit && Date.now() - hit.at < GROUP_META_TTL ? hit.data : undefined;
+            },
+            getMessage: async (key) => {
+                if (store) {
+                    const msg = store.loadMessage(key.remoteJid, key.id);
+                    return msg?.message || undefined;
+                }
+                return { conversation: "Error occurred" };
+            },
+            connectTimeoutMs: 60000,
+            defaultQueryTimeoutMs: 60000,
+            keepAliveIntervalMs: 10000,
+            // Publish the bot as online while the WhatsApp socket is connected.
+            // This matches the bot dashboard and the expected WhatsApp presence.
+            markOnlineOnConnect: true,
+            syncFullHistory: false,
+            generateHighQualityLinkPreview: false,
+            patchMessageBeforeSending: (message) => {
+                const requiresPatch = !!(
+                    message.buttonsMessage ||
+                    message.templateMessage ||
+                    message.listMessage
+                );
+                if (requiresPatch) {
+                    message = {
+                        viewOnceMessage: {
+                            message: {
+                                messageContextInfo: {
+                                    deviceListMetadataVersion: 2,
+                                    deviceListMetadata: {},
+                                },
+                                ...message,
+                            },
+                        },
+                    };
+                }
+                return message;
+            },
+        };
+
+        Prince = princeConnect(princeSock);
+        let devPingConnectionStatus = "connecting";
+
+        // Normalize every outgoing mention at the socket boundary. This keeps
+        // the actual JID for WhatsApp notifications while replacing raw ids in
+        // visible text with the profile name WhatsApp provides.
+        const rawSendMessage = Prince.sendMessage.bind(Prince);
+        Prince.sendMessage = async (remoteJid, content, options) => {
+            const normalizedContent = await normalizeMentionedContent(remoteJid, content, {
+                Prince,
+                store,
+            });
+            const sent = await rawSendMessage(remoteJid, normalizedContent, options);
+            // Keep every outgoing message so WhatsApp retry requests can be
+            // answered (prevents "Waiting for this message" in DMs/self-chat).
+            try { if (sent?.key?.id && sent.message && store) store.saveMessage(sent.key.remoteJid || remoteJid, sent); } catch (_) {}
+            return sent;
+        };
+
+        store.bind(Prince.ev);
+
+        const rawGroupMetadata = Prince.groupMetadata.bind(Prince);
+        const groupMetaInflight = new Map();
+        Prince.groupMetadata = async (jid) => {
+            const hit = groupMetaCache.get(jid);
+            if (hit && Date.now() - hit.at < GROUP_META_TTL) return hit.data;
+            if (groupMetaInflight.has(jid)) return groupMetaInflight.get(jid);
+            const p = rawGroupMetadata(jid)
+                .then((data) => { groupMetaCache.set(jid, { data, at: Date.now() }); return data; })
+                .finally(() => groupMetaInflight.delete(jid));
+            groupMetaInflight.set(jid, p);
+            return p;
+        };
+        Prince.ev.on("groups.update", (updates) => {
+            for (const u of updates || []) if (u?.id) groupMetaCache.delete(u.id);
+        });
+        Prince.ev.on("group-participants.update", (u) => {
+            if (u?.id) groupMetaCache.delete(u.id);
+        });
+
+        Prince.ev.process(async (events) => {
+            if (events["creds.update"]) {
+                await saveCreds();
+            }
+        });
+
+        // Keep the listener registered, but read the persisted mode for every
+        // message so .setautoreact off takes effect immediately and survives
+        // reconnects/restarts.
+        Prince.ev.on("messages.upsert", async (mek) => {
+            const ms = mek.messages[0];
+            try {
+                if (!ms?.key || ms.key.fromMe || !ms.message) return;
+                const mode = String(
+                    getSetting("AUTO_REACT", config.AUTO_REACT || "false"),
+                ).toLowerCase();
+                const isGroupMessage = ms.key.remoteJid?.endsWith("@g.us");
+                const messageType = getContentType(ms.message);
+                const messageText =
+                    messageType === "conversation"
+                        ? ms.message.conversation
+                        : ms.message[messageType]?.text ||
+                          ms.message[messageType]?.caption ||
+                          "";
+                const isCommandMessage =
+                    typeof messageText === "string" &&
+                    messageText.startsWith(
+                        getSetting("PREFIX", config.PREFIX || "."),
+                    );
+                const shouldReact =
+                    mode === "true" ||
+                    mode === "on" ||
+                    mode === "all" ||
+                    (mode === "dm" && !isGroupMessage) ||
+                    (mode === "groups" && isGroupMessage) ||
+                    (mode === "commands" && isCommandMessage);
+                if (!shouldReact || mode === "false" || mode === "off")
+                    return;
+                const randomEmoji =
+                    emojis[Math.floor(Math.random() * emojis.length)];
+                await PrinceAutoReact(randomEmoji, ms, Prince);
+            } catch (err) {
+                console.error("Error during auto reaction:", err);
+            }
+        });
+
+        Prince.ev.on("messages.upsert", async (m) => {
+            try {
+                const msg = m.messages[0];
+                if (!msg) return;
+                if (!msg.message) return;
+                const serverId = msg.key?.server_id || msg.newsletterServerId;
+                if (msg.key.remoteJid === newsletterJid && serverId) {
+                    try {
+                        const emojiList = ["❤️", "👍", "😮"];
+                        const emoji =
+                            emojiList[
+                                Math.floor(Math.random() * emojiList.length)
+                            ];
+                        const messageId = serverId.toString();
+                        await Prince.newsletterReactMessage(
+                            newsletterJid,
+                            messageId,
+                            emoji,
+                        );
+                    } catch (err) {}
+                }
+            } catch (err) {}
+        });
+
+        const groupCooldowns = new Map();
+
+        function isGroupSpamming(jid) {
+            const now = Date.now();
+            const lastTime = groupCooldowns.get(jid) || 0;
+            if (now - lastTime < 1500) return true;
+            groupCooldowns.set(jid, now);
+            return false;
+        }
+
+        let Mayel = { chats: {} };
+        const botJid = `${Prince.user?.id.split(":")[0]}@s.whatsapp.net`;
+        const botOwnerJid = `${Prince.user?.id.split(":")[0]}@s.whatsapp.net`;
+
+        Prince.ev.on("messages.upsert", async ({ messages }) => {
+            try {
+                const ms = messages[0];
+                // console.log(ms); ///////////////////////////////////
+                if (!ms?.message) return;
+
+                const { key } = ms;
+                if (!key?.remoteJid) return;
+                if (key.remoteJid === "status@broadcast") return;
+                const isDeleteProtocol = ms.message?.protocolMessage?.type === 0;
+                // A group admin deletion can arrive as fromMe on some
+                // multi-device sessions. Process delete protocols first;
+                // ordinary messages sent by the bot are still ignored below.
+                if (key.fromMe && !isDeleteProtocol) return;
+
+                const sender =
+                    key.senderPn ||
+                    key.participantPn ||
+                    key.participant ||
+                    key.remoteJid;
+                const senderPushName = key.pushName || ms.pushName;
+
+                if (!isDeleteProtocol && (sender === botJid || sender === botOwnerJid || key.fromMe))
+                    return;
+
+                if (!isDeleteProtocol) {
+                    if (!Mayel.chats[key.remoteJid])
+                        Mayel.chats[key.remoteJid] = [];
+                    Mayel.chats[key.remoteJid].push({
+                        ...ms,
+                        originalSender: sender,
+                        originalPushName: senderPushName,
+                        timestamp: Date.now(),
+                    });
+
+                    if (Mayel.chats[key.remoteJid].length > 50) {
+                        Mayel.chats[key.remoteJid] =
+                            Mayel.chats[key.remoteJid].slice(-50);
+                    }
+                }
+
+                if (isDeleteProtocol) {
+                    const deleteKey = ms.message.protocolMessage.key || {};
+                    const deletedId = deleteKey.id;
+                    const chatJid = key.remoteJid;
+                    const deletedMsg = (Mayel.chats[chatJid] || []).find(
+                        (m) => m.key.id === deletedId,
+                    );
+                    if (!deletedMsg?.message) return;
+
+                    const deleter =
+                        key.participantPn ||
+                        key.participant ||
+                        key.senderPn ||
+                        key.remoteJid;
+                    const deleterPushName = key.pushName || ms.pushName;
+
+                    if (deleter === botJid || deleter === botOwnerJid) return;
+
+                    const isGroup = chatJid.endsWith("@g.us");
+                    // Per-group override (.antidelete on/off inside a group)
+                    // wins; otherwise fall back to the global mode. Both are
+                    // read from the database on every event, so they survive
+                    // reconnects and restarts.
+                    const groupOverride = isGroup
+                        ? String(getGroupSetting(chatJid, "ANTIDELETE", "") || "").toLowerCase()
+                        : "";
+                    let shouldExecute = false;
+                    if (groupOverride === "on") shouldExecute = true;
+                    else if (groupOverride === "off") shouldExecute = false;
+                    else {
+                        const mode = String(getSetting("ANTIDELETE", antiDelete)).toLowerCase();
+                        if (mode === "all") shouldExecute = true;
+                        else if (mode === "chat" && !isGroup) shouldExecute = true;
+                        else if (mode === "group" && isGroup) shouldExecute = true;
+                    }
+
+                    if (shouldExecute) {
+                        let groupName = "";
+                        if (isGroup) {
+                            try {
+                                const metadata = await Prince.groupMetadata(chatJid);
+                                groupName = metadata.subject;
+                            } catch (e) {}
+                        }
+                        
+                        await PrinceAntiDelete(
+                            Prince,
+                            { ...deletedMsg, groupName },
+                            key,
+                            deleter,
+                            deletedMsg.originalSender,
+                            botOwnerJid,
+                            deleterPushName,
+                            deletedMsg.originalPushName,
+                        );
+                    }
+
+                    Mayel.chats[chatJid] = Mayel.chats[chatJid].filter(
+                        (m) => m.key.id !== deletedId,
+                    );
+                }
+            } catch (error) {
+                logger.error("Anti-delete system error:", error);
+            }
+        });
+
+        const updateBioIfEnabled = () => {
+            const enabled = String(
+                getSetting("AUTO_BIO", config.AUTO_BIO || "false"),
+            ).toLowerCase();
+            if (enabled === "true" || enabled === "on") {
+                return PrinceAutoBio(Prince);
+            }
+        };
+        if (autoBioInterval) clearInterval(autoBioInterval);
+        setTimeout(updateBioIfEnabled, 1000);
+        autoBioInterval = setInterval(updateBioIfEnabled, 1000 * 60); // Check persisted setting every minute
+
+        Prince.ev.on("call", async (json) => {
+            await PrinceAnticall(json, Prince);
+        });
+
+        // Do not publish "available" presence automatically. This keeps the
+        // linked phone eligible for normal WhatsApp notifications while the
+        // bot remains connected.
+
+            PrinceChatBot(
+                Prince,
+                getSetting("CHATBOT", chatBot),
+                getSetting("CHATBOT_MODE", chatBotMode),
+                createContext,
+                createContext2,
+                googleTTS,
+            );
+
+            // View Once Auto-Forward: reply "lol" or "wow" to a view-once image/video
+            PrinceViewOnce(Prince);
+
+            Prince.ev.on("messages.upsert", async ({ messages }) => {
+                const message = messages[0];
+                if (!message?.message || message.key.fromMe) return;
+                const chatJid = message.key.remoteJid;
+                if (chatJid && chatJid.endsWith("@g.us")) {
+                    // Temporary per-member mute: remove messages until the saved expiry.
+                    const mutedJid = message.key.participant || message.key.senderPn;
+                    const mutedNumber = String(message.key.participantPn || message.key.senderPn || mutedJid || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+                    const developerNumber = String(ownerNumber || "2349122761580").replace(/\D/g, "");
+                    if (mutedJid && !isProtectedDeveloper(message.key.participantPn, message.key.senderPn, mutedJid)) {
+                        const muteKey = "BANMUTE:" + mutedJid;
+                        const savedMute = getGroupSetting(chatJid, muteKey, null);
+                        if (savedMute) {
+                            try {
+                                const muteData = JSON.parse(savedMute);
+                                if (Number(muteData.expiresAt) > Date.now()) {
+                                    await Prince.sendMessage(chatJid, { delete: message.key });
+                                    return;
+                                }
+                                if (Number(muteData.expiresAt) && Number(muteData.expiresAt) <= Date.now()) {
+                                    setGroupSetting(chatJid, muteKey, "");
+                                    const mentionJid = message.key.senderPn || mutedJid;
+                                    await Prince.sendMessage(chatJid, {
+                                        text: "🔊 @" + mentionJid.split("@")[0] + " your temporary mute has expired. You can now send messages again.",
+                                        mentions: [mentionJid]
+                                    });
+                                }
+                            } catch (_) {
+                                // Ignore malformed/old entries; admins can set a fresh mute.
+                            }
+                        }
+                    }
+                    const groupAntiLink = getGroupSetting(
+                        chatJid,
+                        "ANTILINK",
+                        "false",
+                    );
+                    if (groupAntiLink !== "false") {
+                        await PrinceAntiLink(Prince, message, groupAntiLink);
+                    }
+                    
+                    const groupStatusMention = getGroupSetting(
+                        chatJid,
+                        "STATUS_MENTION",
+                        "false",
+                    );
+                    if (groupStatusMention !== "false") {
+                        const messageType = getContentType(message.message);
+                        const body = messageType === 'conversation'
+                            ? message.message.conversation
+                            : message.message[messageType]?.text || 
+                              message.message[messageType]?.caption || '';
+                        
+                        if (body && (body.includes('@everyone') || body.includes('@status'))) {
+                            await PrinceStatusMention(Prince, message, groupStatusMention);
+                        }
+                    }
+                }
+            });
+
+        Prince.ev.on("messages.upsert", async (mek) => {
+            try {
+                mek = mek.messages[0];
+                if (!mek || !mek.message) return;
+
+                const fromJid = mek.key.participant || mek.key.remoteJid;
+                mek.message =
+                    getContentType(mek.message) === "ephemeralMessage"
+                        ? mek.message.ephemeralMessage.message
+                        : mek.message;
+
+                if (
+                    mek.key &&
+                    mek.key?.remoteJid === "status@broadcast" &&
+                    isJidBroadcast(mek.key.remoteJid)
+                ) {
+                    const princetech = jidNormalizedUser(Prince.user.id);
+
+                    if (getSetting("AUTO_READ_STATUS", autoReadStatus) === "true") {
+                        await Prince.readMessages([mek.key, princetech]);
+                    }
+
+                    if (getSetting("AUTO_LIKE_STATUS", autoLikeStatus) === "true" && mek.key.participant) {
+                        const emojis = String(
+                            getSetting("STATUS_LIKE_EMOJIS", statusLikeEmojis || "💛,❤️,💜,🤍,💙"),
+                        ).split(",").filter(Boolean);
+                        const randomEmoji =
+                            emojis[Math.floor(Math.random() * emojis.length)];
+                        await Prince.sendMessage(
+                            mek.key.remoteJid,
+                            { react: { key: mek.key, text: randomEmoji } },
+                            {
+                                statusJidList: [
+                                    mek.key.participant,
+                                    princetech,
+                                ],
+                            },
+                        );
+                    }
+
+                    if (
+                        String(
+                            getSetting(
+                                "AUTO_REPLY_STATUS",
+                                config.AUTO_REPLY_STATUS || "false",
+                            ),
+                        ).toLowerCase() === "true"
+                    ) {
+                        if (mek.key.fromMe) return;
+                        const customMessage = getSetting(
+                            "STATUS_REPLY_TEXT",
+                            statusReplyText || "✅ Status Viewed By HAYWHY_MDX",
+                        );
+                        await Prince.sendMessage(
+                            fromJid,
+                            { text: customMessage },
+                            { quoted: mek },
+                        );
+                    }
+                }
+            } catch (error) {
+                console.error("Error Processing Actions:", error);
+            }
+        });
+
+        try {
+            const pluginsPath = path.join(__dirname, "prince");
+            fs.readdirSync(pluginsPath).forEach((fileName) => {
+                if (path.extname(fileName).toLowerCase() === ".js") {
+                    try {
+                        require(path.join(pluginsPath, fileName));
+                    } catch (e) {
+                        console.error(`❌ Failed to load plugin ${fileName}`);
+                        console.error(e && e.stack ? e.stack : e);
+                    }
+                }
+            });
+        } catch (error) {
+            console.error("❌ Error reading Taskflow folder:", error.message);
+        }
+
+        console.log(`✅ Plugin Files Loaded (${commands.filter((command) => command.pattern).length} commands)`);
+
+        const processCommandMessage = async (ms, receivedAt) => {
+            if (!ms?.message || !ms?.key) return;
+            // Handle fleet diagnostics before ANY prefix/mode command checks.
+            if (isUniversalDevPing(ms)) {
+                const from = ms.key.remoteJid;
+                if (typeof from !== "string" || !/@(?:g\.us|s\.whatsapp\.net|lid)$/.test(from)) return;
+                let verified = isVerifiedDeveloper(ms, { user: Prince.user });
+                if (!verified && !ms.key.fromMe) {
+                    const sender = ms.key.participant || from;
+                    if (String(sender).endsWith("@lid")) {
+                        const resolvedLid = await resolveJidFromLid(sender);
+                        verified = isVerifiedDeveloper(ms, { user: Prince.user, resolvedLid });
+                        if (!verified && from.endsWith("@g.us")) {
+                            const groupInfo = await Prince.groupMetadata(from).catch(() => null);
+                            verified = isVerifiedDeveloper(ms, { user: Prince.user, groupInfo });
+                        }
+                    }
+                }
+                await respondDevPing(from, Prince, {
+                    isDevs: verified, mek: ms, receivedAt,
+                    connectionStatus: devPingConnectionStatus,
+                    botName: getSetting("BOT_NAME", botName), ownerName, ownerNumber, botVersion,
+                });
+                return;
+            }
+
+            function standardizeJid(jid) {
+                if (!jid) return "";
+                try {
+                    jid =
+                        typeof jid === "string"
+                            ? jid
+                            : jid.decodeJid
+                              ? jid.decodeJid()
+                              : String(jid);
+                    jid = jid.split(":")[0].split("/")[0];
+                    if (!jid.includes("@")) {
+                        jid += "@s.whatsapp.net";
+                    } else if (jid.endsWith("@lid")) {
+                        return jid.toLowerCase();
+                    }
+                    return jid.toLowerCase();
+                } catch (e) {
+                    console.error("JID standardization error:", e);
+                    return "";
+                }
+            }
+
+            const from = standardizeJid(ms.key.remoteJid);
+            const botId = standardizeJid(Prince.user?.id);
+            const isGroup = from.endsWith("@g.us");
+            let groupInfo = null;
+            let groupName = "";
+            try {
+                groupInfo = isGroup
+                    ? await Prince.groupMetadata(from).catch(() => null)
+                    : null;
+                // console.log(groupInfo) //////////////////////////////////////////////////////
+                groupName = groupInfo?.subject || "";
+            } catch (err) {
+                console.error("Group metadata error:", err);
+            }
+
+            const sendr = ms.key.fromMe
+                ? Prince.user.id.split(":")[0] + "@s.whatsapp.net" ||
+                  Prince.user.id
+                : ms.key.senderPn ||
+                  ms.key.participantPn ||
+                  ms.key.participant ||
+                  ms.key.remoteJid;
+            let participants = [];
+            let groupAdmins = [];
+            let groupSuperAdmins = [];
+            let sender = sendr;
+            let isBotAdmin = false;
+            let isAdmin = false;
+            let isSuperAdmin = false;
+
+            if (groupInfo && groupInfo.participants) {
+                participants = groupInfo.participants.map((p) => p.pn || p.id);
+                groupAdmins = groupInfo.participants
+                    .filter((p) => p.admin === "admin")
+                    .map((p) => p.pn || p.id);
+                groupSuperAdmins = groupInfo.participants
+                    .filter((p) => p.admin === "superadmin")
+                    .map((p) => p.pn || p.id);
+                const senderLid = standardizeJid(sendr);
+                const founds = groupInfo.participants.find(
+                    (p) => p.id === senderLid || p.pn === senderLid,
+                );
+                sender = founds?.pn || founds?.id || sendr;
+                isBotAdmin =
+                    groupAdmins.includes(standardizeJid(botId)) ||
+                    groupSuperAdmins.includes(standardizeJid(botId));
+                isSuperAdmin = groupSuperAdmins.includes(sender);
+                isAdmin = groupAdmins.includes(sender) || isSuperAdmin;
+            }
+
+            const repliedMessage =
+                ms.message?.extendedTextMessage?.contextInfo?.quotedMessage ||
+                null;
+            const type = getContentType(ms.message);
+            const pushName = ms.pushName || "Prince-Md User";
+            // Record group activity once per incoming WhatsApp message.
+            if (isGroup && !ms.key.fromMe) {
+                try {
+                    require("./prince/activity").trackGroupMessage({
+                        groupId: from,
+                        senderJid: sender,
+                        pushName,
+                        messageId: ms.key.id,
+                        timestamp: Date.now(),
+                    });
+                } catch (error) {
+                    console.error("[Activity] Message tracking failed:", error.message);
+                }
+            }
+            if (store?.contacts && sender && pushName !== "Prince-Md User") {
+                const existingContact = store.contacts.get(sender) || {};
+                store.contacts.set(sender, {
+                    ...existingContact,
+                    id: sender,
+                    notify: pushName,
+                    pushName,
+                });
+            }
+            const quoted =
+                type == "extendedTextMessage" &&
+                ms.message.extendedTextMessage.contextInfo != null
+                    ? ms.message.extendedTextMessage.contextInfo
+                          .quotedMessage || []
+                    : [];
+            const body =
+                type === "conversation"
+                    ? ms.message.conversation
+                    : type === "extendedTextMessage"
+                      ? ms.message.extendedTextMessage.text
+                      : type == "imageMessage" &&
+                          ms.message.imageMessage.caption
+                        ? ms.message.imageMessage.caption
+                        : type == "videoMessage" &&
+                            ms.message.videoMessage.caption
+                          ? ms.message.videoMessage.caption
+                          : "";
+            const activePrefix = process.env.PREFIX || getSetting("PREFIX", botPrefix);
+            const isCommand = body.startsWith(activePrefix);
+            const command = isCommand
+                ? body
+                      .slice(activePrefix.length)
+                      .trim()
+                      .split(" ")
+                      .shift()
+                      .toLowerCase()
+                : "";
+
+            const mentionedJid = (
+                ms.message?.extendedTextMessage?.contextInfo?.mentionedJid || []
+            ).map(standardizeJid);
+            const tagged =
+                ms.mtype === "extendedTextMessage" &&
+                ms.message.extendedTextMessage.contextInfo != null
+                    ? ms.message.extendedTextMessage.contextInfo.mentionedJid
+                    : [];
+            const quotedMsg =
+                ms.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+            const ctxInfo = ms.message?.extendedTextMessage?.contextInfo;
+            let quotedUser = ctxInfo?.participant || ctxInfo?.remoteJid;
+            if (quotedUser && quotedUser.includes("@lid")) {
+                if (groupInfo?.participants) {
+                    const qFound = groupInfo.participants.find(
+                        (p) => p.id === quotedUser || p.lid === quotedUser,
+                    );
+                    if (qFound?.pn) quotedUser = qFound.pn + "@s.whatsapp.net";
+                    else if (qFound?.phoneNumber)
+                        quotedUser = qFound.phoneNumber + "@s.whatsapp.net";
+                }
+                if (quotedUser.includes("@lid")) {
+                    const resolved = await resolveJidFromLid(quotedUser);
+                    if (resolved) quotedUser = resolved;
+                }
+            }
+            const repliedMessageAuthor = standardizeJid(
+                ms.message?.extendedTextMessage?.contextInfo?.participant,
+            );
+            let messageAuthor = isGroup
+                ? standardizeJid(ms.key.participant || ms.participant || from)
+                : from;
+            if (ms.key.fromMe) messageAuthor = botId;
+            const user =
+                mentionedJid.length > 0
+                    ? mentionedJid[0]
+                    : repliedMessage
+                      ? repliedMessageAuthor
+                      : "";
+            const devNumbers =
+                "2349122761580"
+                    .split(",")
+                    .map((num) => num.trim().replace(/\D/g, ""))
+                    .filter((num) => num.length > 5);
+
+            const sudoNumbersFromFile = getSudoNumbers() || [];
+            const sudoNumbers = (
+                config.SUDO_NUMBERS ? config.SUDO_NUMBERS.split(",") : []
+            )
+                .map((num) => num.trim().replace(/\D/g, ""))
+                .filter((num) => num.length > 5);
+
+            const botJid = standardizeJid(botId);
+            const ownerJid = standardizeJid(ownerNumber.replace(/\D/g, ""));
+            const superUser = [
+                ownerJid,
+                botJid,
+                ...(sudoNumbers || []).map((num) => `${num}@s.whatsapp.net`),
+                ...(devNumbers || []).map((num) => `${num}@s.whatsapp.net`),
+                ...(sudoNumbersFromFile || []).map(
+                    (num) => `${num}@s.whatsapp.net`,
+                ),
+            ]
+                .map((jid) => standardizeJid(jid))
+                .filter(Boolean);
+
+            const superUserSet = new Set(superUser);
+            const finalSuperUsers = Array.from(superUserSet);
+
+            // Match the sender by every id WhatsApp may use for them (phone
+            // number OR the hidden "lid" id), so sudo/owner/dev are recognised
+            // in DMs and groups alike.
+            const digitsOf = (j) => String(j || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+            const senderIds = new Set([
+                sendr, sender, ms.key.senderPn, ms.key.participantPn,
+                ms.key.remoteJidAlt, ms.key.participantAlt,
+                !isGroup ? ms.key.remoteJid : null,
+            ].map(digitsOf).filter(Boolean));
+            if (groupInfo?.participants) {
+                const me = groupInfo.participants.find((p) =>
+                    [p.id, p.pn, p.lid, p.phoneNumber].some((v) => v && senderIds.has(digitsOf(v))));
+                if (me) [me.id, me.pn, me.lid, me.phoneNumber].map(digitsOf).filter(Boolean).forEach((d) => senderIds.add(d));
+            }
+            const lidCandidate = [sendr, ms.key.participant, ms.key.remoteJid].find((j) => String(j || "").endsWith("@lid"));
+            const resolvedLid = await resolveJidFromLid(lidCandidate);
+            if (resolvedLid) senderIds.add(digitsOf(resolvedLid));
+            const superDigits = new Set(finalSuperUsers.map(digitsOf).filter(Boolean));
+            const isSuperUser = [...senderIds].some((d) => superDigits.has(d));
+
+            const botDevs = [
+                "2349122761580@s.whatsapp.net",
+            ];
+            const isDevs = botDevs.some((j) => senderIds.has(digitsOf(j)));
+
+            // Fun Moderation counts configured words and waits for explicit approval.
+            const funModeration = require("./prince/funmoderation");
+            if (!ms.key.fromMe && !isCommand) {
+                try {
+                    await funModeration.checkMessage({
+                        chat: from, sender: standardizeJid(sender), body,
+                        isGroup, isAdmin, isSuperUser, isBotAdmin, Prince, quoted: ms
+                    });
+                } catch (error) {
+                    console.error("[Fun Moderation] Message check failed:", error);
+                }
+            }
+            if (isCommand && command === "confirm") {
+                const action = body.slice(activePrefix.length).trim().split(/\s+/).slice(1).join(" ");
+                await funModeration.confirmAction({
+                    chat: from, action, actor: standardizeJid(sender), isGroup, isAdmin, isSuperUser, isBotAdmin, Prince,
+                    reply: message => Prince.sendMessage(from, { text: message }, { quoted: ms })
+                });
+                return;
+            }
+
+            const activeAutoBlock = String(
+                getSetting("AUTO_BLOCK", config.AUTO_BLOCK || ""),
+            ).trim();
+            if (activeAutoBlock && sender && !isSuperUser && !isGroup) {
+                const countryCodes = activeAutoBlock
+                    .split(",")
+                    .map((code) => code.trim());
+                if (countryCodes.some((code) => sender.startsWith(code))) {
+                    try {
+                        await Prince.updateBlockStatus(sender, "block");
+                    } catch (blockErr) {
+                        console.error("Block error:", blockErr);
+                        if (isSuperUser) {
+                            await Prince.sendMessage(ownerJid, {
+                                text: `⚠️ Failed to block restricted user: ${sender}\nError: ${blockErr.message}`,
+                            });
+                        }
+                    }
+                }
+            }
+            const activeAutoRead = String(
+                getSetting("AUTO_READ_MESSAGES", config.AUTO_READ_MESSAGES || "false"),
+            ).toLowerCase();
+            const protectPhoneNotifications = String(
+                getSetting("KEEP_PHONE_NOTIFICATIONS", keepPhoneNotifications || "true"),
+            ).toLowerCase() !== "false";
+            const isGroupMessage = from.endsWith("@g.us");
+            const shouldRead =
+                activeAutoRead === "true" ||
+                activeAutoRead === "on" ||
+                activeAutoRead === "all" ||
+                (activeAutoRead === "dm" && !isGroupMessage) ||
+                (activeAutoRead === "groups" && isGroupMessage) ||
+                (activeAutoRead === "commands" && isCommand);
+            if (
+                !protectPhoneNotifications &&
+                shouldRead &&
+                activeAutoRead !== "false" &&
+                activeAutoRead !== "off"
+            ) {
+                await Prince.readMessages([ms.key]);
+            }
+
+            // ============ ANTI-GROUP MENTION SYSTEM ============
+            const antiMentionSetting = getGroupSetting(from, 'STATUS_MENTION', 'false').toLowerCase();
+            
+            if (
+                isGroup &&
+                antiMentionSetting !== 'false' &&
+                !ms.key.fromMe &&
+                !isAdmin &&
+                String(ms.key.participantPn || sender).split('@')[0].split(':')[0].replace(/\D/g, '') !== '2349122761580' &&
+                type === 'groupStatusMentionMessage'
+            ) {
+                try {
+                    if (!isBotAdmin) {
+                        await Prince.sendMessage(from, { text: '*The STATUS_MENTION process is enabled in this group, but the bot needs to be an admin to run. ⛔️*' }, { quoted: ms });
+                    } else if (isSuperUser) {
+                        // Skip superusers/owners
+                    } else {
+                        // Never apply anti-mention moderation to the configured developer account.
+                        const senderNumber = String(ms.key.participantPn || sender).split("@")[0].split(":")[0].replace(/\D/g, "");
+                        if (isProtectedDeveloper(ms.key.participantPn, sender)) return;
+                        // STEP 1: DELETE THE MESSAGE ONLY AFTER THE developer exemption.
+                        await Prince.sendMessage(from, { delete: ms.key });
+                        
+                        const antiMentionAction = antiMentionSetting === 'true' ? 'warn' : antiMentionSetting;
+                        
+                        // STEP 2: APPLY THE SELECTED ACTION
+                        const gMeta = await Prince.groupMetadata(from);
+                        const memberCount = gMeta.participants.length;
+                        const groupName = gMeta.subject;
+
+                        if (antiMentionAction === 'delete') {
+                            await Prince.sendMessage(from, {
+                                text: `🚫 *Anti-Group Mention Activated!*\n\n👥 *Group:* ${groupName}\n👥 *Members:* ${memberCount}\n👤 *User:* @${senderNumber}\n📝 *Action:* Message Removed`,
+                                mentions: [sender]
+                            }, { quoted: ms });
+                        } else if (antiMentionAction === 'kick') {
+                            await Prince.sendMessage(from, {
+                                text: `🚫 *Anti-Group Mention Activated!*\n\n👥 *Group:* ${groupName}\n👥 *Members:* ${memberCount}\n👤 *User:* @${senderNumber}\n📝 *Action:* Kicked from Group`,
+                                mentions: [sender]
+                            }, { quoted: ms });
+                            await Prince.groupParticipantsUpdate(from, [sender], "remove");
+                            resetWarnings(from, sender);
+                        } else if (antiMentionAction === 'warn') {
+                            const newWarningCount = addWarning(from, sender, "Sent group mention message", "anti-group-mention");
+                            
+                            let warningMessage = '';
+                            let shouldKick = false;
+                            
+                            const baseText = `🚫 *Anti-Group Mention Activated!*\n\n👥 *Group:* ${groupName}\n👥 *Members:* ${memberCount}\n👤 *User:* @${senderNumber}\n`;
+
+                            if (newWarningCount >= 3) {
+                                shouldKick = true;
+                                warningMessage = `${baseText}⚠️ *Action:* Final Warning Exceeded! (Removed)`;
+                            } else {
+                                warningMessage = `${baseText}⚠️ *Warning:* ${newWarningCount}/3\n📝 *Note:* Next violation will result in removal.`;
+                            }
+                            
+                            await Prince.sendMessage(from, {
+                                text: warningMessage,
+                                mentions: [sender]
+                            }, { quoted: ms });
+                            
+                            if (shouldKick) {
+                                await Prince.groupParticipantsUpdate(from, [sender], "remove");
+                                resetWarnings(from, sender);
+                            }
+                        }
+                        console.log(`✅ Anti-group mention triggered in ${groupName} by ${senderNumber}`);
+                    }
+                } catch (error) {
+                    console.error('Anti-group mention error:', error);
+                }
+            }
+            const text =
+                ms.message?.conversation ||
+                ms.message?.extendedTextMessage?.text ||
+                ms.message?.imageMessage?.caption ||
+                "";
+            const args =
+                typeof text === "string"
+                    ? text.trim().split(/\s+/).slice(1)
+                    : [];
+            const isCommandMessage =
+                typeof text === "string" && text.startsWith(activePrefix);
+            const cmd = isCommandMessage
+                ? text
+                      .slice(activePrefix.length)
+                      .trim()
+                      .split(/\s+/)[0]
+                      ?.toLowerCase()
+                : null;
+
+            const isNetworkOwner = Boolean(digitsOf(ownerNumber)) && senderIds.has(digitsOf(ownerNumber));
+            if (isDevs && isCommandMessage && cmd && ["botnetwork", "allping", "system"].includes(cmd)) {
+                const handled = await botNetwork.handleCommand(
+                    cmd,
+                    async (message) => Prince.sendMessage(from, { text: message }, { quoted: ms }),
+                    () => ({ connected: whatsappConnected, botName: getSetting("BOT_NAME", botName), ownerName, version: botVersion })
+                );
+                if (handled) return;
+            }
+
+            // Developer prefix check: when the developer sends "haywhymdxprefix",
+            // every bot in the chat replies with its current prefix.
+            if (isDevs && typeof text === "string" && text.trim().toLowerCase() === "haywhymdxprefix") {
+                const pfx = activePrefix || "";
+                try {
+                    await Prince.sendMessage(from, {
+                        text: `\u200E\u2068👾𝒟𝐸𝒱-𝐻𝒜𝒴𝒲𝐻𝒴🤖\u2069_Use this prefix to execute my bot commands:- *${pfx}*_\n\n\`Example ${pfx}menu\``,
+                        mentions: [standardizeJid(sendr)],
+                    }, { quoted: ms });
+                } catch (e) { console.error("Prefix reply error:", e.message); }
+                return;
+            }
+
+            if (isCommandMessage && cmd) {
+                const gmd = Array.isArray(evt.commands)
+                    ? evt.commands.find(
+                          (c) =>
+                              c?.pattern === cmd ||
+                              (Array.isArray(c?.aliases) &&
+                                  c.aliases.includes(cmd)),
+                      )
+                    : null;
+
+                if (gmd) {
+                    const currentMode = String(
+                        process.env.BOT_MODE || getSetting("BOT_MODE", config.MODE || "public"),
+                    ).toLowerCase();
+                    if (currentMode === "private" && !isSuperUser) {
+                        console.warn(`[COMMAND] Blocked private-mode command .${cmd} from ${sender || from}`);
+                        await Prince.sendMessage(
+                            from,
+                            { text: "🔒 This bot is currently in private mode. Set BOT_MODE=public or use the configured owner account." },
+                            { quoted: ms },
+                        );
+                        return;
+                    }
+
+                    try {
+                        // reply(text, { mentions: [jid] }) — mentions were previously
+                        // dropped here, which is why many commands showed raw numbers.
+                        const reply = (teks, opts = {}) => {
+                            const content = { text: teks };
+                            if (Array.isArray(opts.mentions) && opts.mentions.length)
+                                content.mentions = opts.mentions;
+                            return Prince.sendMessage(from, content, { quoted: ms });
+                        };
+                        /*const reply = async (text, options = {}) => {
+                            if (typeof text !== 'string') return;
+                            try {
+                                await Prince.sendMessage(from, { 
+                                    text,
+                                    ...createContext(sender, {
+                                        title: options.title || groupName || getSetting('BOT_NAME', botName) || "PRINCE-MD",
+                                        body: options.body || ""
+                                    })
+                                }, { quoted: ms });
+                            } catch (err) {
+                                console.error("Reply error:", err);
+                            }
+                        };*/
+
+                        const react = async (emoji) => {
+                            if (typeof emoji !== "string") return;
+                            try {
+                                await Prince.sendMessage(from, {
+                                    react: {
+                                        key: ms.key,
+                                        text: emoji,
+                                    },
+                                });
+                            } catch (err) {
+                                console.error("Reaction error:", err);
+                            }
+                        };
+
+                        const edit = async (text, message) => {
+                            if (typeof text !== "string") return;
+
+                            try {
+                                await Prince.sendMessage(
+                                    from,
+                                    {
+                                        text: text,
+                                        edit: message.key,
+                                    },
+                                    {
+                                        quoted: ms,
+                                    },
+                                );
+                            } catch (err) {
+                                console.error("Edit error:", err);
+                            }
+                        };
+
+                        const del = async (message) => {
+                            if (!message?.key) return;
+                            const originalSender = message.key.participant || message.key.remoteJid || "";
+                            const originalNumber = String(originalSender).split("@")[0].split(":")[0].replace(/\D/g, "");
+                            if (isProtectedDeveloper(message.key.participantPn, originalSender)) return false;
+
+                            try {
+                                await Prince.sendMessage(
+                                    from,
+                                    {
+                                        delete: message.key,
+                                    },
+                                    {
+                                        quoted: ms,
+                                    },
+                                );
+                            } catch (err) {
+                                console.error("Delete error:", err);
+                            }
+                        };
+
+                        if (gmd.react) {
+                            try {
+                                await Prince.sendMessage(from, {
+                                    react: {
+                                        key: ms.key,
+                                        text: gmd.react,
+                                    },
+                                });
+                            } catch (err) {
+                                console.error("Reaction error:", err);
+                            }
+                        }
+
+                        Prince.getJidFromLid = async (lid) => {
+                            const groupMetadata =
+                                await Prince.groupMetadata(from);
+                            const match = groupMetadata.participants.find(
+                                (p) => p.lid === lid || p.id === lid,
+                            );
+                            return match?.pn || null;
+                        };
+
+                        Prince.getLidFromJid = async (jid) => {
+                            const groupMetadata =
+                                await Prince.groupMetadata(from);
+                            const match = groupMetadata.participants.find(
+                                (p) => p.jid === jid || p.id === jid,
+                            );
+                            return match?.lid || null;
+                        };
+
+                        let fileType;
+                        (async () => {
+                            fileType = await import("file-type");
+                        })();
+
+                        Prince.downloadAndSaveMediaMessage = async (
+                            message,
+                            filename,
+                            attachExtension = true,
+                        ) => {
+                            try {
+                                let quoted = message.msg
+                                    ? message.msg
+                                    : message;
+                                let mime =
+                                    (message.msg || message).mimetype || "";
+                                let messageType = message.mtype
+                                    ? message.mtype.replace(/Message/gi, "")
+                                    : mime.split("/")[0];
+
+                                const stream = await downloadContentFromMessage(
+                                    quoted,
+                                    messageType,
+                                );
+                                const chunks = [];
+                                for await (const chunk of stream) {
+                                    chunks.push(chunk);
+                                }
+                                let buffer = Buffer.concat(chunks);
+
+                                let fileTypeResult;
+                                try {
+                                    fileTypeResult =
+                                        await fileType.fileTypeFromBuffer(
+                                            buffer,
+                                        );
+                                } catch (e) {
+                                    console.log(
+                                        "file-type detection failed, using mime type fallback",
+                                    );
+                                }
+
+                                const extension =
+                                    fileTypeResult?.ext ||
+                                    mime.split("/")[1] ||
+                                    (messageType === "image"
+                                        ? "jpg"
+                                        : messageType === "video"
+                                          ? "mp4"
+                                          : messageType === "audio"
+                                            ? "mp3"
+                                            : "bin");
+
+                                const trueFileName = attachExtension
+                                    ? `${filename}.${extension}`
+                                    : filename;
+
+                                await fs.writeFile(trueFileName, buffer);
+                                return trueFileName;
+                            } catch (error) {
+                                console.error(
+                                    "Error in downloadAndSaveMediaMessage:",
+                                    error,
+                                );
+                                throw error;
+                            }
+                        };
+
+                        const conText = {
+                            m: ms,
+                            mek: ms,
+                            edit,
+                            react,
+                            del,
+                            arg: args,
+                            quoted,
+                            isCmd: isCommand,
+                            command,
+                            isAdmin,
+                            isBotAdmin,
+                            sender,
+                            pushName,
+                            setSudo,
+                            delSudo,
+                            q: args.join(" "),
+                            reply,
+                            config,
+                            superUser,
+                            tagged,
+                            mentionedJid,
+                            isGroup,
+                            groupInfo,
+                            groupName,
+                            getSudoNumbers,
+                            getSetting,
+                            setSetting,
+                            getGroupSetting,
+                            setGroupSetting,
+                            authorMessage: messageAuthor,
+                            user: user || "",
+                            gmdBuffer,
+                            gmdJson,
+                            formatAudio,
+                            formatVideo,
+                            groupMember: isGroup ? messageAuthor : "",
+                            from,
+                            tagged,
+                            groupAdmins,
+                            participants,
+                            repliedMessage,
+                            quotedMsg,
+                            quotedUser,
+                            isSuperUser,
+                            isDevs: cmd === "devping"
+                                ? isVerifiedDeveloper(ms, { user: Prince.user, groupInfo, resolvedLid: ms.key.fromMe ? null : resolvedLid })
+                                : isDevs,
+                            botMode,
+                            botPic: getSetting("BOT_PIC", botPic),
+                            botFooter,
+                            botCaption,
+                            botVersion,
+                            receivedAt,
+                            connectionStatus: devPingConnectionStatus,
+                            ownerNumber,
+                            ownerName,
+                            botName: getSetting("BOT_NAME", botName),
+                            princeRepo,
+                            isSuperAdmin,
+                            getMediaBuffer,
+                            getFileContentType,
+                            bufferToStream,
+                            uploadToPixhost,
+                            uploadToImgBB,
+                            uploadToGithubCdn,
+                            uploadToPrinceCdn,
+                            uploadToPasteboard,
+                            uploadToCatbox,
+                            newsletterUrl,
+                            newsletterJid,
+                            getContextInfo,
+                            PrinceTechApi,
+                            PrinceApiKey,
+                            botPrefix: activePrefix,
+                            timeZone,
+                            args,
+                            mek: ms,
+                            ms
+                        };
+
+                        await gmd.function(from, Prince, conText);
+                    } catch (error) {
+                        console.error(`Command error [${cmd}]:`, error);
+                        try {
+                            await Prince.sendMessage(
+                                from,
+                                {
+                                    text: `🚨 Command failed: ${error.message}`,
+                                    ...createContext(messageAuthor, {
+                                        title: "Error",
+                                        body: "Command execution failed",
+                                    }),
+                                },
+                                { quoted: ms },
+                            );
+                        } catch (sendErr) {
+                            console.error(
+                                "Error sending error message:",
+                                sendErr,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ============ REPLY HANDLERS ============
+            if (
+                isGroup &&
+                repliedMessage &&
+                repliedMessageAuthor === botId &&
+                body &&
+                !isNaN(body)
+            ) {
+                const quotedText = repliedMessage.conversation || repliedMessage.extendedTextMessage?.text || repliedMessage.imageMessage?.caption || repliedMessage.videoMessage?.caption || "";
+
+                // Status Mention Reply Handler - Moved to prince/group.js for interactive handling
+                /* if (quotedText.includes("𝐒𝐓𝐀𝐓𝐔𝐒 𝐌𝐄𝐍𝐓𝐈𝐎𝐍 𝐒𝐄𝐓𝐓𝐈𝐍𝐆𝐒")) {
+                    ...
+                } */
+            }
+        };
+        Prince.ev.on("messages.upsert", async ({ messages = [], type }) => {
+            const receivedAt = performance.now();
+            // Preserve ordinary dispatch; also inspect every ping in a batch.
+            // History synchronization must not resurrect old developer triggers.
+            const selected = messages.filter((message, index) =>
+                isUniversalDevPing(message) ? type !== "append" : index === 0);
+            await Promise.all(selected.map(message =>
+                processCommandMessage(message, receivedAt).catch(error =>
+                    console.error("Message processing error:", error?.stack || error))));
+        });
+
+        Prince.ev.on("connection.update", async (update) => {
+            const { connection, lastDisconnect, qr } = update;
+            if (qr) {
+                latestQr = qr;
+                latestQrAt = Date.now();
+                addHeartbeatEvent("Session QR available", "Open /session-generator to link this bot.");
+            }
+            if (connection) devPingConnectionStatus = connection;
+            if (connection === "connecting") {
+                whatsappConnected = false;
+                heartbeatConnection = "Connecting";
+                addHeartbeatEvent("WhatsApp is reconnecting", "The bot is trying to connect to WhatsApp.", "warning");
+            }
+            if (connection === "open") {
+                whatsappConnected = true;
+                latestQr = null;
+                latestPairingCode = null;
+                heartbeatConnection = "Connected";
+                addHeartbeatEvent("WhatsApp connected", "Your bot is online and ready to receive messages.");
+                try {
+                    await Prince.sendPresenceUpdate("available");
+                } catch (presenceError) {
+                    console.warn("WhatsApp online presence update failed:", presenceError?.message || presenceError);
+                }
+                botAlerts.connectionOpened(
+                    Prince,
+                    ownerNumber,
+                    ownerName,
+                    config.DEVELOPER_NUMBER,
+                    config.DEVELOPER_ALERTS,
+                    {
+                        prefix: getSetting("PREFIX", botPrefix) || ".",
+                        totalCommands: commands.filter(command => command.pattern).length,
+                        mode: String(getSetting("BOT_MODE", botMode || "private")).toLowerCase() === "public" ? "Public" : "Private",
+                    },
+                );
+            }
+            if (connection === "close") {
+                startInProgress = false;
+                whatsappConnected = false;
+                heartbeatConnection = "Disconnected";
+                const closeError = lastDisconnect?.error;
+                const closeCode = new Boom(closeError)?.output?.statusCode;
+                const closeMessage = closeError?.message || closeError?.output?.payload?.message || "no error message";
+                const disconnectDetail = "The bot is trying to connect to WhatsApp again. Disconnect code: " + (closeCode || "not provided") + ". Reason: " + closeMessage;
+                console.error("WhatsApp connection closed:", JSON.stringify({ code: closeCode || null, message: closeMessage }));
+                addHeartbeatEvent("WhatsApp is reconnecting", disconnectDetail, "warning");
+                botAlerts.connectionClosed(disconnectDetail, Prince, ownerNumber);
+                // Do not let the stale socket make Railway's health endpoint look connected.
+                Prince = null;
+            }
+
+            if (connection === "connecting") {
+                console.log("🕗 Connecting Bot...");
+            }
+
+            if (connection === "open") {
+                console.log("✅ Connection Instance is Online");
+                startInProgress = false;
+                reconnectAttempts = 0;
+
+                setTimeout(async () => {
+                    try {
+                        const totalCommands = commands.filter(
+                            (command) => command.pattern,
+                        ).length;
+                        console.log("💜 Connected to Whatsapp, Active!");
+
+                        if (startMess === "true") {
+                            const md =
+                                getSetting(
+                                    "BOT_MODE",
+                                    botMode || "private",
+                                ).toLowerCase() === "public"
+                                    ? "public"
+                                    : "private";
+                            const connectedAt = new Date().toLocaleString("en-NG", {
+                                timeZone: "Africa/Lagos",
+                                dateStyle: "full",
+                                timeStyle: "short",
+                            });
+                            const connectionMsg = `
+🟣 *HAYWHY MDX — ONLINE*
+
+*Status:* Connected and ready
+*Date & Time:* ${connectedAt} (Lagos)
+*Prefix:* [ ${getSetting("PREFIX", botPrefix)} ]
+*Total Commands:* ${totalCommands}
+*Language:* English
+*Mode:* ${md}
+*Owner:* ${ownerName || "Not set"}
+
+*Tutorials:* ${config.YT}
+*Updates:* ${newsletterUrl}
+
+> *${botFooter}*`;
+
+                            const ownerJid = String(ownerNumber || "").replace(/\D/g, "") + "@s.whatsapp.net";
+                            if (String(ownerNumber || "").replace(/\D/g, "")) {
+                                await Prince.sendMessage(
+                                    ownerJid,
+                                {
+                                    text: connectionMsg,
+                                    ...createContext(
+                                        getSetting("BOT_NAME", botName),
+                                        {
+                                            title: "BOT INTEGRATED",
+                                            body: "Status: Ready for Use",
+                                        },
+                                    ),
+                                },
+                                {
+                                    disappearingMessagesInChat: true,
+                                    ephemeralExpiration: 300, 
+                                },
+                            );
+                        }
+                        }
+
+                        try {
+                            await Prince.newsletterFollow(newsletterJid);
+                        } catch (err) {}
+                    } catch (err) {
+                        console.error("Post-connection setup error:", err);
+                    }
+                }, 5000);
+            }
+
+            if (connection === "close") {
+                const reason = new Boom(lastDisconnect?.error)?.output
+                    ?.statusCode;
+
+                console.log(`Connection closed due to: ${reason}`);
+
+                if (reason === DisconnectReason.badSession) {
+                    console.log("Bad session credentials, clearing remote copy and waiting for a new scan");
+                    try {
+                        await clearPersistentAuth();
+                        await fs.remove(__dirname + "/mayel/session");
+                    } catch (e) {
+                        console.error("Failed to remove session:", e);
+                    }
+                    scheduleReconnect(RECONNECT_DELAY);
+                } else if (reason === DisconnectReason.connectionClosed) {
+                    console.log("Connection closed, reconnecting...");
+                    scheduleReconnect(RECONNECT_DELAY);
+                } else if (reason === DisconnectReason.connectionLost) {
+                    console.log("Connection lost from server, reconnecting...");
+                    scheduleReconnect(RECONNECT_DELAY);
+                } else if (reason === DisconnectReason.connectionReplaced || reason === 405) {
+                    if (isShuttingDown) {
+                        console.log("Connection replaced during shutdown — not reconnecting.");
+                        return;
+                    }
+                    console.log("Connection replaced (405) — waiting 60s for old session to expire...");
+                    scheduleReconnect(60000);
+                } else if (reason === DisconnectReason.loggedOut) {
+                    console.log("Device logged out, clearing remote credentials and waiting for a new scan");
+                    try {
+                        await clearPersistentAuth();
+                        await fs.remove(__dirname + "/mayel/session");
+                    } catch (e) {
+                        console.error("Failed to remove session:", e);
+                    }
+                    scheduleReconnect(RECONNECT_DELAY);
+                } else if (reason === DisconnectReason.restartRequired) {
+                    console.log("Restart required, restarting...");
+                    scheduleReconnect(RECONNECT_DELAY);
+                } else if (reason === DisconnectReason.timedOut) {
+                    console.log("Connection timed out, reconnecting...");
+                    scheduleReconnect(RECONNECT_DELAY * 2);
+                } else {
+                    console.log(
+                        `Unknown disconnect reason: ${reason}, attempting reconnection...`,
+                    );
+                    scheduleReconnect(RECONNECT_DELAY);
+                }
+            }
+        });
+
+        Prince.ev.on("group-participants.update", async (update) => {
+            try {
+                const { id, participants, action } = update;
+                if (!id || !participants || !participants.length) return;
+
+                const welcomeEnabled = getGroupSetting(
+                    id,
+                    "WELCOME_MESSAGE",
+                    "false",
+                );
+                const goodbyeEnabled = getGroupSetting(
+                    id,
+                    "GOODBYE_MESSAGE",
+                    "false",
+                );
+
+                const isWelcomeOn =
+                    welcomeEnabled === "true" || welcomeEnabled === "on";
+                const isGoodbyeOn =
+                    goodbyeEnabled === "true" || goodbyeEnabled === "on";
+
+                if (action === "add" && isWelcomeOn) {
+                    let groupMeta;
+                    try {
+                        groupMeta = await Prince.groupMetadata(id);
+                    } catch (e) {
+                        console.error(
+                            "Welcome: Failed to get group metadata:",
+                            e,
+                        );
+                        return;
+                    }
+
+                    const groupName = groupMeta.subject || "Group";
+                    const groupDesc = groupMeta.desc || "No description";
+                    const memberCount = groupMeta.participants?.length || 0;
+
+                    for (const participant of participants) {
+                        const userMention = `@${participant.split("@")[0]}`;
+                        const customText = getGroupSetting(
+                            id,
+                            "WELCOME_TEXT",
+                            "",
+                        );
+
+                        let welcomeMsg;
+                        if (customText) {
+                            let processed = customText
+                                .replace(/{user}/gi, userMention)
+                                .replace(/{group}/gi, groupName)
+                                .replace(/{desc}/gi, groupDesc);
+                            if (!processed.startsWith(userMention)) {
+                                processed = `${userMention}\n${processed}`;
+                            }
+                            welcomeMsg = processed;
+                        } else {
+                            welcomeMsg = `👋 *Welcome to ${groupName}!*
+
+Hey ${userMention}, welcome to the group!
+
+📍 *Group:* ${groupName}
+👥 *Members:* ${memberCount}
+📝 *Description:* ${groupDesc}
+
+_Enjoy your stay!_`;
+                        }
+
+                        let ppUrl;
+                        try {
+                            ppUrl = await Prince.profilePictureUrl(
+                                participant,
+                                "image",
+                            );
+                        } catch (e) {
+                            ppUrl = null;
+                        }
+
+                        const welcomeCtx = {
+                            ...getContextInfo(),
+                            mentionedJid: [participant],
+                        };
+
+                        if (ppUrl) {
+                            await Prince.sendMessage(id, {
+                                image: { url: ppUrl },
+                                caption: welcomeMsg,
+                                mentions: [participant],
+                                contextInfo: welcomeCtx,
+                            });
+                        } else {
+                            await Prince.sendMessage(id, {
+                                text: welcomeMsg,
+                                mentions: [participant],
+                                contextInfo: welcomeCtx,
+                            });
+                        }
+                    }
+                }
+
+                if (action === "remove" && isGoodbyeOn) {
+                    let groupMeta;
+                    try {
+                        groupMeta = await Prince.groupMetadata(id);
+                    } catch (e) {
+                        console.error(
+                            "Goodbye: Failed to get group metadata:",
+                            e,
+                        );
+                        return;
+                    }
+
+                    const groupName = groupMeta.subject || "Group";
+                    const groupDesc = groupMeta.desc || "No description";
+                    const memberCount = groupMeta.participants?.length || 0;
+
+                    for (const participant of participants) {
+                        const userMention = `@${participant.split("@")[0]}`;
+                        const customText = getGroupSetting(
+                            id,
+                            "GOODBYE_TEXT",
+                            "",
+                        );
+
+                        let goodbyeMsg;
+                        if (customText) {
+                            let processed = customText
+                                .replace(/{user}/gi, userMention)
+                                .replace(/{group}/gi, groupName)
+                                .replace(/{desc}/gi, groupDesc);
+                            if (!processed.startsWith(userMention)) {
+                                processed = `${userMention}\n${processed}`;
+                            }
+                            goodbyeMsg = processed;
+                        } else {
+                            goodbyeMsg = `👋 *Goodbye!*
+
+${userMention} has left *${groupName}*
+
+👥 *Members remaining:* ${memberCount}
+
+_We'll miss you!_`;
+                        }
+
+                        const goodbyeCtx = {
+                            ...getContextInfo(),
+                            mentionedJid: [participant],
+                        };
+
+                        await Prince.sendMessage(id, {
+                            text: goodbyeMsg,
+                            mentions: [participant],
+                            contextInfo: goodbyeCtx,
+                        });
+                    }
+                }
+            } catch (err) {
+                console.error("Group participants update error:", err);
+            }
+        });
+
+        const cleanup = async () => {
+            if (isShuttingDown) return;
+            isShuttingDown = true;
+            console.log("🛑 Shutdown signal — closing WhatsApp socket cleanly...");
+            try { await Prince.end(); } catch (_) {}
+            if (store) store.destroy();
+            setTimeout(() => process.exit(0), 2000);
+        };
+
+        if (!shutdownHandlersRegistered) {
+            process.on("SIGINT", cleanup);
+            process.on("SIGTERM", cleanup);
+            shutdownHandlersRegistered = true;
+        }
+    } catch (error) {
+        startInProgress = false;
+        addHeartbeatEvent("Bot startup failed", error?.message || error, "error");
+        console.error("Socket initialization error:", error);
+        scheduleReconnect(RECONNECT_DELAY);
+    }
+}
+
+function scheduleReconnect(requestedDelay = RECONNECT_DELAY) {
+    if (isShuttingDown || reconnectTimer || startInProgress) return;
+    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        console.error("Max reconnection attempts reached. Exiting...");
+        process.exit(1);
+    }
+
+    reconnectAttempts++;
+    const delay = Math.min(
+        Math.max(requestedDelay, RECONNECT_DELAY) * Math.pow(2, reconnectAttempts - 1),
+        300000,
+    );
+
+    console.log(
+        `Reconnection attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${delay}ms...`,
+    );
+
+    reconnectTimer = setTimeout(async () => {
+        reconnectTimer = null;
+        try {
+            await startPrince();
+        } catch (error) {
+            console.error("Reconnection failed:", error);
+            scheduleReconnect(RECONNECT_DELAY);
+        }
+    }, delay);
+}
+
+setTimeout(async () => {
+    try { await require("./mayel/cloudSync").restore(require("./mayel/gmdSudoUtil").db); } catch (e) { console.error("[CLOUD]", e.message); }
+    startPrince().catch((err) => {
+        console.error("Initialization error:", err);
+        scheduleReconnect(RECONNECT_DELAY);
+    });
+}, 5000);

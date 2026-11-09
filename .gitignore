@@ -1,0 +1,9 @@
+node_modules/
+mayel/temp/bin/
+.env
+.env.*
+!.env.example
+mayel/session/
+*.db
+*.sqlite
+*.sqlite3
