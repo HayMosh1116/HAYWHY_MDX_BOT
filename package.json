@@ -13,6 +13,7 @@
     "test": "node test/ytAudio.test.js && node test/musicProviders.test.js",
     "check:auth": "node --check index.js && node --check mayel/persistentAuth.js",
     "preflight:heroku": "node scripts/heroku-preflight.js",
+    "preflight:deploy": "node scripts/deployment-preflight.js",
     "stop": "pm2 stop princemd",
     "restart": "pm2 restart princemd"
   },
