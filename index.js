@@ -28,7 +28,6 @@ const {
     PrinceAntiLink,
     PrinceAutoBio,
     PrinceChatBot,
-    loadSession,
     getMediaBuffer,
     getSudoNumbers,
     getSetting,
@@ -252,8 +251,6 @@ app.post("/api/session/pairing", async (req, res) => {
 app.listen(PORT, () => console.log(`Server Running on Port: ${PORT}`));
 
 const sessionDir = path.join(__dirname, "mayel", "session");
-
-loadSession();
 
 let store;
 let autoBioInterval;
