@@ -126,6 +126,10 @@ botNetwork.installNetworkApi(app);
 let Prince;
 let whatsappConnected = false;
 let clearPersistentAuth = async () => {};
+let closePersistentAuth = async () => {};
+let activePersistentAuth = null;
+let activeSocket = null;
+let socketGeneration = 0;
 let latestQr = null;
 let latestQrAt = 0;
 let latestPairingCode = null;
@@ -261,6 +265,14 @@ let reconnectTimer = null;
 let startInProgress = false;
 let shutdownHandlersRegistered = false;
 
+async function clearLocalAuthFiles() {
+    await fs.ensureDir(sessionDir);
+    const names = await fs.readdir(sessionDir);
+    await Promise.all(names
+        .filter((name) => name.endsWith(".json"))
+        .map((name) => fs.remove(path.join(sessionDir, name))));
+}
+
 // Group metadata cache: fetching it from WhatsApp on every group message was
 // a major source of slow replies. Entries expire after 15 minutes and are
 // dropped immediately when the group or its participants change.
@@ -287,6 +299,7 @@ async function resolveJidFromLid(jid) {
 async function startPrince() {
     if (isShuttingDown || startInProgress) return;
     startInProgress = true;
+    const generation = ++socketGeneration;
     try {
         let version;
         try {
@@ -302,7 +315,14 @@ async function startPrince() {
             directory: sessionDir,
             sessionKey: process.env.BOT_ID || config.SESSION_ID || ownerNumber || botName,
         });
+        if (generation !== socketGeneration || isShuttingDown) {
+            await auth.close();
+            startInProgress = false;
+            return;
+        }
+        activePersistentAuth = auth;
         clearPersistentAuth = auth.clearRemoteFiles;
+        closePersistentAuth = auth.close;
         const { state, saveCreds } = auth;
 
         if (store) {
@@ -361,6 +381,9 @@ async function startPrince() {
         };
 
         Prince = princeConnect(princeSock);
+        activeSocket = Prince;
+        const princeSocket = Prince;
+        const isCurrentSocket = () => socketGeneration === generation && Prince === princeSocket;
         let devPingConnectionStatus = "connecting";
 
         // Normalize every outgoing mention at the socket boundary. This keeps
@@ -1530,6 +1553,8 @@ async function startPrince() {
 
         Prince.ev.on("connection.update", async (update) => {
             const { connection, lastDisconnect, qr } = update;
+            if (!isCurrentSocket()) return;
+            let closedAuth = null;
             if (qr) {
                 latestQr = qr;
                 latestQrAt = Date.now();
@@ -1576,7 +1601,12 @@ async function startPrince() {
                 console.error("WhatsApp connection closed:", JSON.stringify({ code: closeCode || null, message: closeMessage }));
                 addHeartbeatEvent("WhatsApp is reconnecting", disconnectDetail, "warning");
                 botAlerts.connectionClosed(disconnectDetail, Prince, ownerNumber);
-                // Do not let the stale socket make Railway's health endpoint look connected.
+                closedAuth = activePersistentAuth;
+                activePersistentAuth = null;
+                activeSocket = null;
+                clearPersistentAuth = async () => {};
+                closePersistentAuth = async () => {};
+                // Do not let this closed socket make Railway's health endpoint look connected.
                 Prince = null;
             }
 
@@ -1662,14 +1692,20 @@ async function startPrince() {
 
                 console.log(`Connection closed due to: ${reason}`);
 
+                // Stop all persistence activity before a new socket is created.
+                // Otherwise an old creds.update can repopulate MongoDB after a
+                // bad-session cleanup and produce an endless reconnect loop.
+                const clearCredentials = reason === DisconnectReason.badSession || reason === DisconnectReason.loggedOut;
+                try {
+                    if (clearCredentials && closedAuth) await closedAuth.clearRemoteFiles();
+                    if (closedAuth) await closedAuth.close();
+                    if (clearCredentials) await clearLocalAuthFiles();
+                } catch (cleanupError) {
+                    console.error("Failed to clean persistent session:", cleanupError);
+                }
+
                 if (reason === DisconnectReason.badSession) {
                     console.log("Bad session credentials, clearing remote copy and waiting for a new scan");
-                    try {
-                        await clearPersistentAuth();
-                        await fs.remove(__dirname + "/mayel/session");
-                    } catch (e) {
-                        console.error("Failed to remove session:", e);
-                    }
                     scheduleReconnect(RECONNECT_DELAY);
                 } else if (reason === DisconnectReason.connectionClosed) {
                     console.log("Connection closed, reconnecting...");
@@ -1686,12 +1722,6 @@ async function startPrince() {
                     scheduleReconnect(60000);
                 } else if (reason === DisconnectReason.loggedOut) {
                     console.log("Device logged out, clearing remote credentials and waiting for a new scan");
-                    try {
-                        await clearPersistentAuth();
-                        await fs.remove(__dirname + "/mayel/session");
-                    } catch (e) {
-                        console.error("Failed to remove session:", e);
-                    }
                     scheduleReconnect(RECONNECT_DELAY);
                 } else if (reason === DisconnectReason.restartRequired) {
                     console.log("Restart required, restarting...");
@@ -1871,8 +1901,10 @@ _We'll miss you!_`;
         const cleanup = async () => {
             if (isShuttingDown) return;
             isShuttingDown = true;
+            socketGeneration++;
             console.log("🛑 Shutdown signal — closing WhatsApp socket cleanly...");
             try { await Prince.end(); } catch (_) {}
+            try { await closePersistentAuth(); } catch (_) {}
             if (store) store.destroy();
             setTimeout(() => process.exit(0), 2000);
         };
@@ -1884,6 +1916,10 @@ _We'll miss you!_`;
         }
     } catch (error) {
         startInProgress = false;
+        try { await closePersistentAuth(); } catch (_) {}
+        activePersistentAuth = null;
+        activeSocket = null;
+        closePersistentAuth = async () => {};
         addHeartbeatEvent("Bot startup failed", error?.message || error, "error");
         console.error("Socket initialization error:", error);
         scheduleReconnect(RECONNECT_DELAY);

@@ -1,6 +1,5 @@
 const fs = require("fs-extra");
 const path = require("path");
-const crypto = require("crypto");
 const { MongoClient } = require("mongodb");
 const { useMultiFileAuthState } = require("prince-baileys");
 
@@ -49,7 +48,6 @@ async function createPersistentAuthState({ directory, sessionKey }) {
   const collection = client
     .db(getDatabaseName())
     .collection("whatsapp_auth_files");
-  const prefix = `${safeSessionKey}:`;
 
   async function readRemoteFiles() {
     const documents = await collection.find({ bot: safeSessionKey }).toArray();
@@ -61,73 +59,90 @@ async function createPersistentAuthState({ directory, sessionKey }) {
     return documents.length;
   }
 
+  let uploadTimer = null;
+  let uploadInProgress = null;
+  let uploadAgain = false;
+  let closed = false;
+  let remoteCleared = false;
+
   async function uploadLocalFiles() {
+    if (closed || remoteCleared) return;
     const names = await fs.readdir(directory);
     const files = names.filter((name) => name.endsWith(".json"));
-    if (!files.length) return;
+    if (!files.length || closed || remoteCleared) return;
 
     const operations = [];
     for (const file of files) {
+      if (closed || remoteCleared) return;
       const data = (await fs.readFile(path.join(directory, file))).toString("base64");
       operations.push({
         updateOne: {
           filter: { bot: safeSessionKey, file },
           update: {
-            $set: {
-              bot: safeSessionKey,
-              file,
-              data,
-              updatedAt: new Date(),
-            },
+            $set: { bot: safeSessionKey, file, data, updatedAt: new Date() },
           },
           upsert: true,
         },
       });
     }
 
-    await collection.bulkWrite(
-      operations,
-      { ordered: false },
-    );
+    if (operations.length && !closed && !remoteCleared) {
+      await collection.bulkWrite(operations, { ordered: false });
+    }
   }
 
+  const persist = async () => {
+    if (closed || remoteCleared) return;
+    if (uploadInProgress) {
+      uploadAgain = true;
+      return uploadInProgress;
+    }
+    uploadInProgress = uploadLocalFiles()
+      .catch((error) => {
+        if (!closed && !remoteCleared) {
+          console.error("[AUTH] MongoDB session backup failed:", explainMongoError(error));
+        }
+      })
+      .finally(() => {
+        uploadInProgress = null;
+        if (uploadAgain && !closed && !remoteCleared) {
+          uploadAgain = false;
+          schedulePersist();
+        }
+      });
+    return uploadInProgress;
+  };
+
+  const schedulePersist = () => {
+    if (closed || remoteCleared) return;
+    clearTimeout(uploadTimer);
+    uploadTimer = setTimeout(() => { void persist(); }, 350);
+    uploadTimer.unref?.();
+  };
+
   async function clearRemoteFiles() {
+    remoteCleared = true;
+    clearTimeout(uploadTimer);
+    uploadAgain = false;
+    if (uploadInProgress) await uploadInProgress.catch(() => {});
     await collection.deleteMany({ bot: safeSessionKey });
+  }
+
+  async function close() {
+    if (closed) return;
+    closed = true;
+    clearTimeout(uploadTimer);
+    uploadAgain = false;
+    if (uploadInProgress) await uploadInProgress.catch(() => {});
+    await client.close().catch(() => {});
   }
 
   try {
     const remoteCount = await readRemoteFiles();
     const auth = await useMultiFileAuthState(directory);
-    let uploadTimer = null;
-    let uploadInProgress = false;
-    let uploadAgain = false;
-
-    const persist = async () => {
-      if (uploadInProgress) {
-        uploadAgain = true;
-        return;
-      }
-      uploadInProgress = true;
-      try {
-        await uploadLocalFiles();
-      } catch (error) {
-        console.error("[AUTH] MongoDB session backup failed:", explainMongoError(error));
-      } finally {
-        uploadInProgress = false;
-        if (uploadAgain) {
-          uploadAgain = false;
-          schedulePersist();
-        }
-      }
-    };
-
-    const schedulePersist = () => {
-      clearTimeout(uploadTimer);
-      uploadTimer = setTimeout(() => persist(), 350);
-      uploadTimer.unref?.();
-    };
 
     const saveCreds = async () => {
+      if (closed || remoteCleared) return;
       await auth.saveCreds();
       schedulePersist();
     };
@@ -143,11 +158,11 @@ async function createPersistentAuthState({ directory, sessionKey }) {
       state: auth.state,
       saveCreds,
       clearRemoteFiles,
-      close: () => client.close().catch(() => {}),
+      close,
       sessionKey: safeSessionKey,
     };
   } catch (error) {
-    await client.close().catch(() => {});
+    await close();
     throw new Error(`[AUTH] Persistent session initialization failed: ${explainMongoError(error)}`);
   }
 }
