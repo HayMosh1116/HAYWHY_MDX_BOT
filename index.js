@@ -940,6 +940,9 @@ async function startPrince() {
                       .shift()
                       .toLowerCase()
                 : "";
+            if (isCommand) {
+                console.log(`[COMMAND RECEIVED] prefix=${JSON.stringify(activePrefix)} command=${command} chat=${from}`);
+            }
 
             const mentionedJid = (
                 ms.message?.extendedTextMessage?.contextInfo?.mentionedJid || []
@@ -1543,6 +1546,16 @@ async function startPrince() {
             // History synchronization must not resurrect old developer triggers.
             const selected = messages.filter((message, index) =>
                 isUniversalDevPing(message) ? type !== "append" : index === 0);
+            for (const message of selected) {
+                const diagnosticText = message?.message?.conversation
+                    || message?.message?.extendedTextMessage?.text
+                    || message?.message?.imageMessage?.caption
+                    || message?.message?.videoMessage?.caption
+                    || "";
+                if (typeof diagnosticText === "string" && /^[.F]/i.test(diagnosticText.trim())) {
+                    console.log(`[INCOMING COMMAND EVENT] type=${type || "unknown"} text=${JSON.stringify(diagnosticText.trim().slice(0, 80))}`);
+                }
+            }
             await Promise.all(selected.map(message =>
                 processCommandMessage(message, receivedAt).catch(error =>
                     console.error("Message processing error:", error?.stack || error))));
